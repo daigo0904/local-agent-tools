@@ -1,0 +1,3 @@
+report.py の日付を `YYYY-MM-DD` 形式に変更しました。test_report.py は成功し、invoice.py と util.py の出力が変わらないことも確認しました。
+
+結果: 達成

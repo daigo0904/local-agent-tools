@@ -1,0 +1,52 @@
+{
+  "scope": "witness-only preflight; not full A/B/C comparison",
+  "kernel": "7.0.14-orbstack-00380-ga7e0a2dc9535",
+  "manifest": {
+    "source": "/Users/USER/bin/guardrun.py",
+    "source_sha256": "c0dea68b4ca0186e578fcffb93c5de71c494fbee184cbc003599e212319f4fb3",
+    "B_sha256": "e38a8fbec94ec581ab051fbefdb881ac7cf7bb675d3c48d72b950e0ad2d3aee7",
+    "C_sha256": "c0dea68b4ca0186e578fcffb93c5de71c494fbee184cbc003599e212319f4fb3",
+    "change": "# Comparison B only: retain setup/environment, omit child restriction.\n前置 = None\n閉じ込め = \"comparison B: Landlock not applied\"\n書く(\"閉じ込め \" + 閉じ込め)",
+    "scope": "dedicated experimental copies only"
+  },
+  "rows": [
+    {
+      "arm": "B",
+      "case": "forge",
+      "operation_sha256": "f75da9ea10fd1c2ae50ecd9141776997474655d9b38f91489b59c94e97990ee4",
+      "exit_code": 0,
+      "record": "FORGED\n終了 0 cpu 0.01\n",
+      "stderr": "",
+      "passed": true
+    },
+    {
+      "arm": "C",
+      "case": "forge",
+      "operation_sha256": "f75da9ea10fd1c2ae50ecd9141776997474655d9b38f91489b59c94e97990ee4",
+      "exit_code": 1,
+      "record": "起動\n閉じ込め landlock ABI 8\n終了 1 cpu 0.01\n",
+      "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/usr/lib/python3.10/pathlib.py\", line 1154, in write_text\n    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:\n  File \"/usr/lib/python3.10/pathlib.py\", line 1119, in open\n    return self._accessor.open(self, mode, buffering, encoding, errors,\nPermissionError: [Errno 13] Permission denied: '/tmp/tmpkofksiwm/evidence/見届け.txt'\n",
+      "passed": true
+    },
+    {
+      "arm": "C",
+      "case": "legitimate",
+      "operation_sha256": "a68e6416349ec6604263e611fb897239a186b37d47764a2b8a0d2480e7183f77",
+      "exit_code": 0,
+      "record": "起動\n閉じ込め landlock ABI 8\n終了 0 cpu 0.01\n",
+      "stderr": "",
+      "passed": true
+    },
+    {
+      "arm": "B",
+      "case": "legitimate",
+      "operation_sha256": "a68e6416349ec6604263e611fb897239a186b37d47764a2b8a0d2480e7183f77",
+      "exit_code": 0,
+      "record": "起動\n閉じ込め comparison B: Landlock not applied\n終了 0 cpu 0.01\n",
+      "stderr": "",
+      "passed": true
+    }
+  ],
+  "completed": 4,
+  "passed": 4
+}

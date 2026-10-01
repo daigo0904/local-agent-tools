@@ -1,0 +1,81 @@
+name: reset-check
+# リセット後の検証（判定基準.md）。1回で Windows と Ubuntu 2種を全部回す。
+# 各行の頭に【番号】を付けて出す（集計.py がこれで拾う）。
+on:
+  workflow_dispatch:
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: 用意
+        shell: pwsh
+        run: python bin/guardrun.py --壁の利用者を作る
+      - name: W1 証明（now）
+        continue-on-error: true
+        run: python bin/guardrun.py --verify 2>&1 | grep -E "執行:|  (○|★) " | sed "s/^/【W1】/"
+      - name: W2 印の試験（now）
+        continue-on-error: true
+        timeout-minutes: 10
+        run: PYTHONPATH=bin python bin/guardrun-印の試験 bin/guardrun.py 2>&1 | sed "s/^/【W2】/"
+      - name: W3 実測（now）
+        continue-on-error: true
+        run: PYTHONPATH=bin python bin/guardrun-実測 bin/guardrun.py --回数 5 2>&1 | grep -E "^(○|✗) |上乗せ|^\{" | sed "s/^/【W3】/"
+      - name: W4 受領証の照合
+        continue-on-error: true
+        run: PYTHONPATH=bin python t/t_receipt.py bin/guardrun.py 2>&1 | tail -4 | sed "s/^/【W4】/"
+      - name: W5 ファイル1つの許可
+        continue-on-error: true
+        run: PYTHONPATH=bin python t/t_fileread.py bin/guardrun.py 2>&1 | tail -2 | sed "s/^/【W5】/"
+      - name: W6 秘密の対照
+        continue-on-error: true
+        run: python bin/guardrun.ctl2.py --verify 2>&1 | grep -E "  (○|★) 秘密" | sed "s/^/【W6】/"
+      - name: W7 時間（now と sid）
+        continue-on-error: true
+        timeout-minutes: 20
+        run: PYTHONPATH=bin python t/t_winprof2.py bin/guardrun.py bin/guardrun.sid.py 6 2>&1 | tail -6 | sed "s/^/【W7】/"
+      - name: W8 sid の証明・印・実測
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          python bin/guardrun.sid.py --verify 2>&1 | grep -E "  (○|★) " | sed "s/^/【W8証明】/"
+          PYTHONPATH=bin python bin/guardrun-印の試験 bin/guardrun.sid.py 2>&1 | tail -1 | sed "s/^/【W8印】/"
+          PYTHONPATH=bin python bin/guardrun-実測 bin/guardrun.sid.py --回数 3 2>&1 | grep -E "^\{" | sed "s/^/【W8実測】/"
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: 用意
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap acl
+          sudo useradd -r -M -s /bin/sh _guardrun || true
+          sudo chmod 755 /home/runner
+      - name: L1 閉じ込め
+        continue-on-error: true
+        run: PYTHONPATH=bin python3 t/t_confine.py bin/guardrun.py 2>&1 | tail -2 | sed "s/^/【L1】/"
+      - name: L2 証明
+        continue-on-error: true
+        run: python3 bin/guardrun.py --verify 2>&1 | grep -E "執行:|  (○|★) " | sed "s/^/【L2】/"
+      - name: L3 印の試験
+        continue-on-error: true
+        timeout-minutes: 10
+        run: PYTHONPATH=bin python3 bin/guardrun-印の試験 bin/guardrun.py 2>&1 | sed "s/^/【L3】/"
+      - name: L4 実測
+        continue-on-error: true
+        run: PYTHONPATH=bin python3 bin/guardrun-実測 bin/guardrun.py --回数 5 2>&1 | grep -E "^(○|✗) |上乗せ|^\{" | sed "s/^/【L4】/"
+      - name: L5 外に書く
+        continue-on-error: true
+        run: PYTHONPATH=bin python3 t/t_outside.py bin/guardrun.py 2>&1 | tail -4 | sed "s/^/【L5】/"

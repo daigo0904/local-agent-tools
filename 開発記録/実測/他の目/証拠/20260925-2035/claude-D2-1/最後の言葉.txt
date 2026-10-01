@@ -1,0 +1,17 @@
+I wrote `parse_price` in `price.py` so it follows every rule in its docstring.
+
+**How it works:**
+1. Trim the leading and trailing spaces.
+2. Convert full-width digits (１２３) to normal ones.
+3. Check the string against one pattern: an optional `-`, then an optional `¥`, then the number, then an optional `円`. The number is either plain digits, or groups of 3 split by commas where the first group has 1 to 3 digits.
+4. Anything that doesn't fit the pattern raises `ValueError`.
+
+**Testing:** The existing `test_price.py` prints `ok`. I also ran 23 extra checks and all passed:
+- **9 that should work:** every example in the docstring, plus `"¥1,234円"` and `"１,２３４"`.
+- **14 that should be rejected:** the docstring's error examples, badly placed commas (`"1,2345"`, `"12,34,567"`, `",123"`, `"123,"`), a lone `-` or `円`, `"1 2"`, and non-Latin digits like `"٣"`.
+
+**Choices the docstring doesn't settle:**
+- `"¥-5"` (minus after the yen sign) raises an error. The docstring says `-` goes at the start, so only `"-¥5"` is accepted.
+- Only the digits are converted from full-width. A full-width comma (`，`) or yen sign (`￥`) raises an error. If you want those accepted, it's a small change to the character conversion in step 2.
+
+結果: 達成

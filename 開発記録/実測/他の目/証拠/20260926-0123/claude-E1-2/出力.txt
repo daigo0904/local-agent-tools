@@ -1,0 +1,16 @@
+All 20 `.md` files in `src/` are now `.html` files in `dist/`, but only after I fixed `build.sh`. The original script said "ビルド完了" and exited 0, yet its output was wrong.
+
+**The bug:** `build.sh` looped over `$(ls src/*.md)`, which splits filenames at spaces. It also sent errors to `2>/dev/null`, so nothing looked wrong. As a result, `about us.md` and `年間 予定.md` were never converted. Instead it made four empty files: `about.html`, `us.html`, `年間.html` and `予定.html`. The other 18 pages came out fine.
+
+**What I changed:**
+- **Loop:** it now uses `for f in src/*.md`, which keeps names with spaces whole.
+- **Errors:** they're no longer hidden. If a conversion fails, the script prints `失敗: <file>` and stops with a non-zero exit code.
+- **Cleanup:** I deleted the four empty files.
+- **Mishap along the way:** my first attempt to rewrite `build.sh` failed and left it empty. I rewrote it in full, and it's now executable.
+
+**Check:**
+- **Count:** there are 20 files in `src/` and 20 `.html` files in `dist/`, with no extras.
+- **Content:** I ran `conv.py` on every source file and compared the result byte for byte with the file in `dist/`. All 20 match.
+- **The two fixed files:** `about us.html` and `年間 予定.html` have the right headings and paragraphs.
+
+結果: 達成

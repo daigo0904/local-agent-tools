@@ -1,0 +1,44 @@
+{
+  "対照コミット": "a51d533",
+  "推論": false,
+  "終了コード": {
+    "before": 1,
+    "after": 0,
+    "integration": 0
+  },
+  "完了件数": {
+    "before": 4,
+    "after": 4,
+    "integration": 40
+  },
+  "files": {
+    "before.py": {
+      "bytes": 322851,
+      "sha256": "e248b7c85200d25b52f2c40d486219774182c38ce6e741f8e4de33ccc37b5513"
+    },
+    "after.jsonl": {
+      "bytes": 256,
+      "sha256": "8f78cc2ef29ff41e8193c9867cb5b25e2a58463c04f7f4a0756f014a5846c52e"
+    },
+    "test.py": {
+      "bytes": 1887,
+      "sha256": "59d55866d52e51ced66769c1df3fcddd7ad3b2bfca62904296aae2c6babd7275"
+    },
+    "after.py": {
+      "bytes": 323182,
+      "sha256": "777937ac1268cde1b8c7ff462233a3604160ff6586175de5aa3a3b63c38d4eba"
+    },
+    "integration.log": {
+      "bytes": 3747,
+      "sha256": "fa98615ff4c6ddb9e77f9b053aaccc34e1fe366de9e7ddacbc5df07e876d102d"
+    },
+    "criteria.md": {
+      "bytes": 492,
+      "sha256": "923f1369884d0d17f09a99580c5c761fd1b89feb364bd744e92a60e39aca3b2f"
+    },
+    "before.jsonl": {
+      "bytes": 258,
+      "sha256": "d9618cbc2a96559aacae0c0492e508eb698f819809c481194225a3b20abe9eb8"
+    }
+  }
+}

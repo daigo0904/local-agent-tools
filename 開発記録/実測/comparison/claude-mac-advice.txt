@@ -1,0 +1,48 @@
+## Probable cause (unverified, needs one test)
+
+I think `(target others)` did not match the witness because the witness and child are in the **same process group**. Reverse-engineered SBPL documentation lists three signal targets: `self`, `pgrp` and `others`. I read `others` as "not self and not my process group". Python `subprocess` keeps the child in the parent's process group unless you ask otherwise. So the kill likely matched `pgrp`, which your profile never denied.
+
+**Test to confirm:** leave the profile as it is and launch the child with `start_new_session=True`. If `os.kill(os.getppid(), 9)` then fails with EPERM, this explanation is right.
+
+## Profile
+
+```scheme
+(version 1)
+(allow default)
+; ...your file-write denies...
+(deny signal)
+(allow signal (target self))
+(allow signal (target pgrp))
+```
+
+Launch with `start_new_session=True`, so the child leads a new session and process group and the witness is not in it.
+
+How sure I am about each piece:
+
+| Item | Status |
+|---|---|
+| `signal` operation and `(target self)` | Known. Apple and Chromium profiles use them. |
+| `(target pgrp)`, `(target others)` | Known from reverse-engineered SBPL docs, not Apple documentation. |
+| Exact meaning of `pgrp` / `others` | My inference. The test above checks it. |
+| A later `allow` overriding an earlier `deny` for the same operation | Believed, not verified here. Test it. |
+| `(target same-sandbox)` | Guess from memory. If it exists, it would be the best fit, because descendants inherit the sandbox and the witness has none. Try `(allow signal (target same-sandbox))` in place of the `pgrp` line; if `sandbox-exec` rejects the profile, that answers it. |
+
+**Remaining gap with `pgrp`:** a descendant that creates its own process group (an interactive shell with job control, a `setsid` daemon, some test runners) becomes `others`. Its parent could then no longer signal it. `same-sandbox` would avoid this, if it exists.
+
+## Tests to run before trusting this
+
+Count EPERM vs success for each case, not "it looked fine":
+
+1. Child kills the witness (`getppid`) → EPERM
+2. Child kills its own child → allowed
+3. Child kills a grandchild that called `setsid` → decide what you want, then check it
+4. Child kills an unrelated process with the same uid → EPERM
+5. `kill(0, sig)` and `killpg` from the child → must not reach the witness. The new session makes this true by construction.
+
+## Alternatives that don't rely on Seatbelt semantics
+
+- **Different uid (strongest, known POSIX behaviour):** if the witness runs as a uid other than the agent's (the human uid, or root), `kill` fails with EPERM in the kernel whatever the profile says. Your production path is already uid + sandbox, so check which uid the witness has there. Your test may have run with both processes under the same uid.
+- **Treat the witness's death as a result, not a hole:** you already write "not finished" up front and let `guardrun-sweep` turn an unchanged record into an interruption receipt. Also have an outside process check that the witness's pid is gone while its record is still unfinished, and mark that as its own outcome ("witness killed"). That catches the kill even if some signal path is still open.
+- **Don't make the witness the parent:** a small launcher starts the child, and the witness watches from outside (for example with kqueue `EVFILT_PROC`). The child can no longer find the witness via `getppid`, but it could still find it with `ps`, so this only helps together with the uid split.
+
+My recommendation: use the uid split as the real protection, add `start_new_session` plus `deny signal` / `allow self` / `allow pgrp` as a second layer, and log a killed witness as its own outcome.

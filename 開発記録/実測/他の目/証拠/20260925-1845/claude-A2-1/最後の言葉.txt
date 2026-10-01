@@ -1,0 +1,10 @@
+`calc.py` の `add` 関数は、足し算ではなく引き算（`a - b`）をしていたので、`a + b` に直しました。
+
+```python
+def add(a, b):
+    return a + b
+```
+
+実行による確認はできていません。Bash が毎回 `EPERM: operation not permitted, mkdir '/private/tmp/claude-501/...'` で失敗し、`python3` で動かせませんでした。変更は1文字だけで、コードを読む限り正しい足し算になっています。
+
+結果: 達成

@@ -1,0 +1,114 @@
+{
+  "source": "/Users/USER/bin/guardrun.py",
+  "cases": [
+    {
+      "case": "不要なimportを除く",
+      "expected": "緑",
+      "actual": "緑",
+      "reasons": [
+        "report.py が 33% 縮んだ（3行→2行）。少量の縮小として注意（内容の正しさは未判定）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "小さい設定の1行削減",
+      "expected": "緑",
+      "actual": "緑",
+      "reasons": [
+        "config.txt が 50% 縮んだ（2行→1行）。少量の縮小として注意（内容の正しさは未判定）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "9行削減",
+      "expected": "緑",
+      "actual": "緑",
+      "reasons": [
+        "data.txt が 45% 縮んだ（20行→11行）。少量の縮小として注意（内容の正しさは未判定）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "10行削減",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        "data.txt が 50% 縮んだ（20行→10行）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "30パーセント境界",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        "data.txt が 30% 縮んだ（100行→70行）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "30パーセント未満",
+      "expected": "緑",
+      "actual": "緑",
+      "reasons": [],
+      "passed": true
+    },
+    {
+      "case": "既知の大幅縮小",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        "data.txt が 75% 縮んだ（442行→111行）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "1行を空にする",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        "config.txt が 100% 縮んだ（1行→0行）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "3行を空にする",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        "config.txt が 100% 縮んだ（3行→0行）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "ファイル削除",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        "config.txt が消えた（1行）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "hookの小さい変更",
+      "expected": "赤",
+      "actual": "赤",
+      "reasons": [
+        ".git/hooks/pre-commit が置かれた（あとで壁の外で走る）",
+        ".git/hooks/pre-commit が 33% 縮んだ（3行→2行）。少量の縮小として注意（内容の正しさは未判定）"
+      ],
+      "passed": true
+    },
+    {
+      "case": "変更なし",
+      "expected": "青",
+      "actual": "青",
+      "reasons": [
+        "何も変わっていない"
+      ],
+      "passed": true
+    }
+  ],
+  "passed": 12,
+  "total": 12
+}

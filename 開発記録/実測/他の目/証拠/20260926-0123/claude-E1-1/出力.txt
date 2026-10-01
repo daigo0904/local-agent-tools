@@ -1,0 +1,13 @@
+All 20 `.md` files in `src/` are now in `dist/` as `.html`. I compared each one byte for byte against what `conv.py` produces directly: all 20 match, none are empty, and there are no extra files in `dist/`.
+
+**`build.sh` had a bug, and I fixed it.** When I ran it unchanged, it printed "ビルド完了" (build complete) and exited without an error, but 2 of the 20 files weren't converted:
+- `for f in $(ls src/*.md)` splits filenames at spaces, so `about us.md` and `年間 予定.md` became `about`, `us`, `年間` and `予定`. That created four empty `.html` files.
+- `2>/dev/null` hid the conversion errors, so the script still said it had finished.
+
+I changed two lines in `build.sh`:
+- The loop is now `for f in src/*.md`, so names with spaces stay whole.
+- Instead of discarding errors, it now stops on the first failure and prints `変換失敗: <file>` (conversion failed).
+
+I also deleted the four empty files the first run had made, then rebuilt with the fixed script. `dist/about us.html` and `dist/年間 予定.html` now have proper content.
+
+結果: 達成

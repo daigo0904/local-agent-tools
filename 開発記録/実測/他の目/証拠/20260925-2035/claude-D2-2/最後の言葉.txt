@@ -1,0 +1,14 @@
+I wrote `parse_price` in `price.py` to follow the docstring. The existing `test_price.py` passes, and so do all the docstring examples, each with the expected value or `ValueError`.
+
+**How it works:** it trims surrounding spaces, converts full-width digits to normal ones, then removes a leading `-`, then a `¥`, then a trailing `円`, in that order. What's left must be plain digits, or digits with a comma every 3 places. If it isn't, it raises `ValueError`.
+
+**Choices I made where the docstring doesn't say:**
+- `"¥1,234円"`, with both a `¥` and a `円`, reads as 1234.
+- `"¥-5"` is a `ValueError`, because the docstring only allows `-` at the very front.
+- A full-width comma (`１，２３４`) is a `ValueError`, because the docstring only covers full-width digits.
+- Other number characters, like `²` or Arabic digits, are `ValueError`.
+- `"-"` on its own is a `ValueError`, since it has no digits.
+
+**What went wrong:** my first attempt to write the file failed partway and left `price.py` empty. I rewrote the whole file with the Write tool, and the docstring is exactly as it was. The checks above were run on the rewritten file.
+
+結果: 達成

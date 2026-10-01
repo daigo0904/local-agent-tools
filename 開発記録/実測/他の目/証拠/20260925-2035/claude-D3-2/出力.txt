@@ -1,0 +1,8 @@
+I converted 59 of the 60 files to UTF-8 and overwrote them. `037.txt` is the one I couldn't convert, and I left it untouched.
+
+- **The 59 converted files:** each decoded cleanly as strict Shift_JIS. After writing, I checked that converting the UTF-8 back to Shift_JIS reproduces the original bytes exactly for every file, so no characters changed. All 59 now read as valid UTF-8.
+- **`037.txt`:** the file isn't entirely valid Shift_JIS. At offset 12 (right after 「記録 37 番。」) there are two bytes, `85 FF`, that aren't a character in Shift_JIS or CP932. Comparing with neighbouring files like `036.txt`, which go straight from 「番。」 to 「東京都…」, these two bytes look like corruption, probably from a broken edit. There are only two ways to force a conversion: swap them for a replacement character (�) or delete them. Either one changes the contents, which breaks your condition, so I didn't do it.
+
+If you decide on one of those (for example, "delete the two bytes, since the text matches 036 and the others"), I'll convert it right away.
+
+結果: 未達

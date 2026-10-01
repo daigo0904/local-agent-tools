@@ -1,0 +1,15 @@
+I converted 59 of the 60 files to UTF-8. `037.txt` couldn't be converted and is unchanged.
+
+**The 59 converted files:** Before writing each file, I checked that the UTF-8 text reads back to the same characters, and that converting it back to Shift_JIS gives the original bytes exactly. After writing, all 59 read as valid UTF-8. No file used characters that Shift_JIS and CP932 read differently, like `\` or `〜`, so the choice between the two made no difference. No BOM was added, and line endings are unchanged (LF).
+
+**The one that failed, `037.txt`:** Your request assumed all 60 files were Shift_JIS, but this one isn't valid Shift_JIS.
+- Right after "記録 37 番。" there are 2 extra bytes, `0x85 0xFF`. They aren't a character in Shift_JIS or CP932 (the Windows version of Shift_JIS).
+- Every other file has "記録 NN 番。" followed straight away by "東京都…". So these 2 bytes are most likely corrupted or stray bytes, not text.
+- To convert it I'd have to either delete the 2 bytes or turn them into a replacement mark like `�`. Both change the contents, which you asked me not to do, so I left the file as it was.
+
+To finish it, choose one:
+1. Delete the 2 bytes and convert. The file would then match the other 59.
+2. Convert it with the 2 bytes replaced by `�`, so there's a visible trace of them.
+3. Leave it as it is and check where the original data came from.
+
+結果: 未達

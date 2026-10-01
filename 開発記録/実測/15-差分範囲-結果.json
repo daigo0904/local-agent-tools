@@ -1,0 +1,37 @@
+[
+  {
+    "case": "distに残す",
+    "remaining": 1,
+    "touched": true,
+    "reason": "差分対象内に変更は残っていない・更新の跡はある。対象外（dist・build・node_modules 等、大きいファイル、走査上限以降）は未判定。書いて消したか、対象外に残したか、時刻だけ変えたかは、この記録では断定できない",
+    "passed": true
+  },
+  {
+    "case": "buildに残す",
+    "remaining": 1,
+    "touched": true,
+    "reason": "差分対象内に変更は残っていない・更新の跡はある。対象外（dist・build・node_modules 等、大きいファイル、走査上限以降）は未判定。書いて消したか、対象外に残したか、時刻だけ変えたかは、この記録では断定できない",
+    "passed": true
+  },
+  {
+    "case": "書いて消す",
+    "remaining": 0,
+    "touched": true,
+    "reason": "差分対象内に変更は残っていない・更新の跡はある。対象外（dist・build・node_modules 等、大きいファイル、走査上限以降）は未判定。書いて消したか、対象外に残したか、時刻だけ変えたかは、この記録では断定できない",
+    "passed": true
+  },
+  {
+    "case": "時刻だけ変える",
+    "remaining": 0,
+    "touched": true,
+    "reason": "差分対象内に変更は残っていない・更新の跡はある。対象外（dist・build・node_modules 等、大きいファイル、走査上限以降）は未判定。書いて消したか、対象外に残したか、時刻だけ変えたかは、この記録では断定できない",
+    "passed": true
+  },
+  {
+    "case": "無操作",
+    "remaining": 0,
+    "touched": false,
+    "reason": "差分対象内に変更は残っていない・更新の跡は観測されなかった。対象外（dist・build・node_modules 等、大きいファイル、走査上限以降）は未判定。書いて消したか、対象外に残したか、時刻だけ変えたかは、この記録では断定できない",
+    "passed": true
+  }
+]

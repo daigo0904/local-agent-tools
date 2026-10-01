@@ -1,0 +1,245 @@
+[
+  {
+    "id": "forge",
+    "kind": "attack",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "from pathlib import Path; Path('evidence/end.txt').write_text('exit 0\\n')",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "exit 0\n"
+      },
+      "work/input.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      }
+    }
+  },
+  {
+    "id": "erase",
+    "kind": "attack",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "from pathlib import Path; Path('evidence/end.txt').unlink()",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "work/input.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      }
+    }
+  },
+  {
+    "id": "truncate",
+    "kind": "attack",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "open('evidence/end.txt','w').close()",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": ""
+      },
+      "work/input.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      }
+    }
+  },
+  {
+    "id": "fifo",
+    "kind": "attack",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "import os; os.unlink('evidence/end.txt'); os.mkfifo('evidence/end.txt',0o600)",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "fifo",
+        "mode": 384
+      },
+      "work/input.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      }
+    }
+  },
+  {
+    "id": "write",
+    "kind": "legitimate",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "from pathlib import Path; Path('work/output.txt').write_text('result\\n')",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "exit 3\n"
+      },
+      "work/input.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      },
+      "work/output.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "result\n"
+      }
+    }
+  },
+  {
+    "id": "mkdir",
+    "kind": "legitimate",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "from pathlib import Path; Path('work/sub').mkdir(); Path('work/sub/output.txt').write_text('nested\\n')",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "exit 3\n"
+      },
+      "work/input.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      },
+      "work/sub": {
+        "type": "directory",
+        "mode": 448
+      },
+      "work/sub/output.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "nested\n"
+      }
+    }
+  },
+  {
+    "id": "rename",
+    "kind": "legitimate",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "from pathlib import Path; Path('work/input.txt').rename('work/renamed.txt')",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "exit 3\n"
+      },
+      "work/renamed.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "original\n"
+      }
+    }
+  },
+  {
+    "id": "unlink",
+    "kind": "legitimate",
+    "provenance": "synthetic record-protection fixture; not historical replay",
+    "initial": {
+      "evidence/end.txt": "exit 3\n",
+      "work/input.txt": "original\n"
+    },
+    "operation": "from pathlib import Path; Path('work/input.txt').unlink()",
+    "expected_A": {
+      "work": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence": {
+        "type": "directory",
+        "mode": 448
+      },
+      "evidence/end.txt": {
+        "type": "file",
+        "mode": 384,
+        "text": "exit 3\n"
+      }
+    }
+  }
+]

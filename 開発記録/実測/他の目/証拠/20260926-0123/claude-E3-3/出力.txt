@@ -1,0 +1,7 @@
+I added up the `amount` column and wrote the total to `total.txt`: **735849**. The file contains only the number, with no line break at the end.
+
+- All 300 data rows were included. Ten of them are negative and were added as they are.
+- 30 rows weren't plain numbers: they were written as `"4,986"`, `¥2517` or `3855円`. I removed the comma, `¥` and `円` and added them as ordinary numbers. Every one of them converted cleanly.
+- The same date appears on more than one row with different items. I didn't remove any rows as duplicates.
+
+結果: 達成

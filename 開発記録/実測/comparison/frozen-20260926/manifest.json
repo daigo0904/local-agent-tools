@@ -1,0 +1,8 @@
+{
+  "source": "/Users/USER/bin/guardrun.py",
+  "source_sha256": "c0dea68b4ca0186e578fcffb93c5de71c494fbee184cbc003599e212319f4fb3",
+  "B_sha256": "e38a8fbec94ec581ab051fbefdb881ac7cf7bb675d3c48d72b950e0ad2d3aee7",
+  "C_sha256": "c0dea68b4ca0186e578fcffb93c5de71c494fbee184cbc003599e212319f4fb3",
+  "change": "# Comparison B only: retain setup/environment, omit child restriction.\n前置 = None\n閉じ込め = \"comparison B: Landlock not applied\"\n書く(\"閉じ込め \" + 閉じ込め)",
+  "scope": "dedicated experimental copies only"
+}

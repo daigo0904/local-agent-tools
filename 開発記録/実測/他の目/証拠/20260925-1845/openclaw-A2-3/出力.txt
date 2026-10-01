@@ -1,0 +1,3 @@
+[33m[agent/embedded][39m [36mtool-search: cataloged 51 tools behind compact prompt surface[39m
+[33m[agent/embedded][39m [36m[context-pressure-diagnostic] admitted provider attempt for ollama/gemma4:26b route=compact_only estimatedPromptTokens=27315 promptBudgetBeforeReserve=24576[39m
+[31m[memory][39m [33mmemory_index_chunks_vec not updated — semantic vector embeddings unavailable — no vector dimensions resolved. Vector recall degraded. Further duplicate warnings suppressed.[39m

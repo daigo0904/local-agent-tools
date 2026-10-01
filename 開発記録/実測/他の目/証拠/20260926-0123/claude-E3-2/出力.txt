@@ -1,0 +1,7 @@
+I added up the amount column and wrote the result, **735849**, to `total.txt` (the file contains only that number and a newline).
+
+- **What's in the file:** 300 data rows. 30 of them weren't plain numbers: 10 used a thousands separator like `"4,986"`, 10 had a `¥` prefix like `¥2517`, and 10 had a `円` suffix like `3855円`.
+- **How I read those rows:** I removed the commas, the `¥` and the `円`, then converted each value to a whole number. After that, every one of the 300 values was a plain number, so none were skipped.
+- **Negative values:** there were 10, and they're included in the total as they are.
+
+結果: 達成

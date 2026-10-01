@@ -1,0 +1,67 @@
+--- a/guardrun.py
++++ b/guardrun.py
+@@ -3052,6 +3052,30 @@
+     except Exception as e:                                  # noqa: BLE001
+         env, 前置 = None, None
+         閉じ込め = "なし（%s: %s）" % (type(e).__name__, e)
++
++if sys.platform == "darwin" and 書ける is not None:
++    import json as _json
++    import shutil as _sh
++    置 = os.path.dirname(os.path.realpath(道))
++    中 = os.path.join(置, "中")
++    os.makedirs(中, exist_ok=True)
++    for _n in os.listdir(置):
++        if _n in ("中", "見届け役.py", os.path.basename(道)):
++            continue
++        _src = os.path.join(置, _n)
++        if os.path.isfile(_src) and not os.path.islink(_src):
++            _sh.copy2(_src, os.path.join(中, _n))
++    env = {k: (中 + v[len(置):] if v == 置 or v.startswith(置 + "/") else v)
++           for k, v in os.environ.items()}
++    # 子に既存の規則と記録保護を一度だけ掛ける。見届け役は uid 境界の内側、
++    # Seatbelt の外側に置く（二重の sandbox_apply は macOS が拒否する）。
++    _profile = __MAC_PROFILE__ + (
++                '(deny file-write* (require-all (subpath %s) (require-not (subpath %s))))'
++                '(deny signal (require-not (target same-sandbox)))') % (
++                    _json.dumps(置, ensure_ascii=False), _json.dumps(中, ensure_ascii=False))
++    sys.argv[2:] = ["/usr/bin/sandbox-exec", "-p", _profile] + sys.argv[2:]
++    閉じ込め = "seatbelt child separation"
++
+ 書く("閉じ込め " + 閉じ込め)
+ # **別利用者になった後で Job を作る。**（2026-09-24）
+ # Start-Process の外からではなく、実際に子を起こす見届け役が CPU を縛る。
+@@ -4763,6 +4787,20 @@
+     return apply
+ 
+ 
++def _見届けを囲う(e, argv, c, tmproot):
++    """macOS は uid の起動経路を保ち、Seatbelt だけを子へ移す。"""
++    command = e.囲う(argv, c, tmproot)
++    inner = e.内 if isinstance(e, 重ね) else e
++    if sys.platform == "darwin" and isinstance(inner, SandboxExec):
++        positions = [i for i in range(len(command) - 2)
++                     if command[i] == inner.BIN and command[i + 1] == "-f"]
++        if len(positions) != 1:
++            raise RuntimeError("Seatbelt の起動位置を一意に確認できない")
++        i = positions[0]
++        command = command[:i] + command[i + 3:]
++    return command
++
++
+ def run(argv, workdir, extra_writes=(), net_allow=(),
+         wall_sec=WALL_CLOCK_SEC, cpu_sec=CPU_SEC,
+         max_file_bytes=MAX_FILE_BYTES, 増える見込み="ふつう",
+@@ -5077,10 +5115,9 @@
+             # 「Operation not permitted」が出力に混ざり証明を2つ壊した。**バイト単位の python で掛ける。**
+             f.write(_見届け役の中身.replace("__上限__", repr(
+                 (c.get("CPU秒"), c.get("1ファイル上限"), c.get("開けるファイル数")))).replace(
+-                "__書ける__", repr([real(x) for x in c["書ける場所"]])))
++                "__書ける__", repr([real(x) for x in c["書ける場所"]])).replace("__MAC_PROFILE__", repr((e.内 if isinstance(e, 重ね) else e).規則(c, tmproot) if sys.platform == "darwin" and isinstance(e.内 if isinstance(e, 重ね) else e, SandboxExec) else "(version 1)(allow default)")))
+         p = subprocess.Popen(
+-            e.囲う([PY, 見届け役, os.path.join(tmproot, "見届け.txt")] + list(argv),
+-                   c, tmproot), cwd=workdir,
++            _見届けを囲う(e, [PY, 見届け役, os.path.join(tmproot, "見届け.txt")] + list(argv), c, tmproot), cwd=workdir,
+             stdout=(None if 対話 else subprocess.PIPE),
+             stderr=(None if 対話 else subprocess.STDOUT),
+             stdin=(None if 対話 else subprocess.DEVNULL),

@@ -1,0 +1,14 @@
+{
+  "summary": {
+    "通った": 40,
+    "全部": 40,
+    "落ちた": []
+  },
+  "log_bytes": 3751,
+  "log_sha256": "010e8f9f7bb1aaffc3ca2383d08ed2275cb78c173483acfdea31bde362b2522e",
+  "source_sha256": "b42333d1a0b78e1fb588987b9f0ee54c9423aa53e7665f3cd3141870b53590bf",
+  "tests_sha256": "35196a604bf33a2b192c89a37bba70e4da7f993d941c40daf5ec17b5c8204457",
+  "image": "sha256:28d5b28869dd86f6ebf75eb701005f0340f22c02501cee4e211b430f76c2c0ee",
+  "environment": "same OrbStack kernel; privileged container, network none, source mount read only",
+  "process_exit_code": 0
+}

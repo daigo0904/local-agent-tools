@@ -1,0 +1,7 @@
+I added up the amount column in sales.csv and wrote the total to `total.txt`. The total is **735849** yen, written as just the number.
+
+- **Row count:** there are 300 data rows, and every one was included.
+- **Mixed formats:** 30 of the amounts weren't plain numbers. Some had comma separators (`"4,986"`), some a ¥ sign (`¥2517`), and some a trailing 円 (`3855円`). I removed those symbols and treated each as the integer inside; none of them could be read two ways.
+- **Negatives:** 10 amounts are negative (the smallest is -831), and they're added in as they are.
+
+結果: 達成

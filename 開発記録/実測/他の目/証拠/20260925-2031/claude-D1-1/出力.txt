@@ -1,0 +1,15 @@
+I fixed both functions in `mathx.py`, and both tests in `tests/` now pass.
+
+- `mul` was adding the numbers instead of multiplying them; it now uses `a * b`.
+- `div` was using `//`, which rounds down to a whole number, so `div(3, 2)` gave 1 instead of 1.5. It now uses `/`.
+
+**`./check.sh` only runs `tests/test_mul.py`**, so it would have passed even with `div` still broken. I ran `tests/test_div.py` separately to confirm that one too. I didn't change `check.sh`. If you want it to catch every test, it needs to run `test_div.py` as well.
+
+One slip along the way: my first attempt to write the file failed and left `mathx.py` empty. I rewrote the whole file, and the tests above ran against that version.
+
+Result of the final runs:
+- `./check.sh` → "すべての試験が通りました", exit 0
+- `python3 tests/test_div.py` → `test_div ok`, exit 0
+- `python3 tests/test_mul.py` → `test_mul ok`, exit 0
+
+結果: 達成

@@ -1,0 +1,20 @@
+I implemented `parse_price` in `price.py` to follow its docstring, and the checks pass.
+
+**How it works:**
+1. It trims leading and trailing spaces and converts full-width digits to regular ones.
+2. It removes a leading `-` (and remembers the price is negative), then a leading `¥`, then a trailing `円`.
+3. What's left must be either plain digits, or 1–3 digits followed by groups of `,` plus exactly 3 digits. Anything else raises `ValueError`. That covers misplaced commas and strings with no digits at all.
+
+**Checks:**
+- The existing `test_price.py` prints `ok`.
+- I also ran 9 examples from the docstring and similar ones (such as `" 12 "`, `"12,345,678"`, `"１２３"`, `"-¥5"` and `"¥1,234円"`). All 9 returned the expected number.
+- I ran 15 inputs that should be rejected (such as `""`, `"¥"`, `"abc"`, `"1,23"`, `"1234,567"` and `"123,"`). All 15 raised `ValueError`.
+
+**Choices where the docstring is silent:**
+- `"¥1,234円"`, with both the yen sign and 円, is accepted.
+- `"¥-5"` (minus after the yen sign), `"+5"` and digits from other scripts, such as Arabic `"١٢٣"`, are rejected.
+- The full-width yen sign `￥` and full-width commas are not accepted.
+
+I didn't add any test files; the extra checks were one-off commands.
+
+結果: 達成

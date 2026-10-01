@@ -1,0 +1,7 @@
+`report.py` now outputs dates as `2026-09-25`, and `test_report.py` passes (it prints `ok`).
+
+- **What I changed:** `report.py` builds the date itself as `%04d-%02d-%02d` and no longer uses `util.fmt_date`.
+- **Why I left `util.py` alone:** `invoice.py` also uses `fmt_date`, so changing it would have changed the invoice dates too. I checked that the invoice header still reads `2026/09/25`. `util.py` and `invoice.py` are unchanged.
+- **One mishap along the way:** my first attempt to write the file failed, and it left `report.py` empty (0 bytes) for a moment. I rewrote it in full with the new version, so the only change from your original is the date format.
+
+結果: 達成

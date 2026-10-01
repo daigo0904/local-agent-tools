@@ -1,0 +1,15 @@
+ファイルは変更していません。以下の実装で、正常系10件・異常系12件の確認が通りました。
+
+```python
+import re
+
+
+def parse_price(s):
+    s = s.strip()
+    pattern = r"-?¥?(?:[0-9０-９]+|[0-9０-９]{1,3}(?:,[0-9０-９]{3})+)円?"
+    if re.fullmatch(pattern, s) is None:
+        raise ValueError(f"不正な値段: {s!r}")
+    return int(s.replace("¥", "").removesuffix("円").replace(",", ""))
+```
+
+結果: 達成

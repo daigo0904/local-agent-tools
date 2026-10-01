@@ -1,0 +1,8 @@
+{
+  "comparison/full.py": "fcc1d661114885b2253b57ba7e965a841f53d439ee1ebc0103c6b6242d28fa04",
+  "comparison/check_full.py": "822d304662f618e181048bbbaf1dd22ff5d561bdfee77704b71e0b784def3ce3",
+  "comparison/frozen-20260926/C.py": "c0dea68b4ca0186e578fcffb93c5de71c494fbee184cbc003599e212319f4fb3",
+  "comparison/frozen-20260926/B.py": "e38a8fbec94ec581ab051fbefdb881ac7cf7bb675d3c48d72b950e0ad2d3aee7",
+  "comparison/frozen-20260926/manifest.json": "6a11690ba8b56aa8e2ff4762f0d1fb196832a341d55368d6bbd83f01d37e2fc6",
+  ".github/workflows/mitou-comparison.yml": "689ed24678169a1c06246ce8b4122bd456d654a56161d47730ecade558b1492c"
+}

@@ -1,0 +1,5 @@
+`price.py` の `parse_price` を docstring の仕様どおりに実装しました。全角数字、負数、通貨表記、カンマ位置の検証に対応しています。
+
+`python3 test_price.py` で既存・追加テストがすべて成功しました。
+
+結果: 達成

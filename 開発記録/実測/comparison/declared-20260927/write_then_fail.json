@@ -1,0 +1,175 @@
+{
+  "case": "write_then_fail",
+  "command": "import sys;open('out','w').write('partial');sys.exit(3)",
+  "initial": {
+    "input": "original"
+  },
+  "expected": {
+    "判定": "失敗",
+    "終了コード": 3,
+    "差分": {
+      "追加": [
+        "out"
+      ],
+      "削除": [],
+      "変更": []
+    }
+  },
+  "preserved_records": "write_then_fail-records",
+  "expected_files": {
+    "input": "original",
+    "out": "partial"
+  },
+  "files": {
+    "out": "partial",
+    "input": "original"
+  },
+  "receipt": {
+    "id": "20260927-073707-20618-a3fe7a",
+    "作業場": "/Users/Shared/declared-plfq2te4/work",
+    "命令": [
+      "/opt/homebrew/opt/python@3.14/bin/python3.14",
+      "-c",
+      "import sys;open('out','w').write('partial');sys.exit(3)"
+    ],
+    "執行": "別ユーザ (uid 分離) + sandbox-exec (macOS)",
+    "終了コード": 3,
+    "秒": 0.3,
+    "壁に当たった": null,
+    "拒否の跡": [],
+    "外へ出られる": [],
+    "見届け": {
+      "起動": true,
+      "終わり": [
+        "終了",
+        3,
+        0.02
+      ],
+      "閉じ込め": "seatbelt child separation"
+    },
+    "片付けの残り": [],
+    "差分": {
+      "追加": [
+        {
+          "path": "out",
+          "行": 1
+        }
+      ],
+      "削除": [],
+      "変更": []
+    },
+    "判定": "失敗",
+    "理由": [
+      "書き換えはあるが、命令は失敗で終わった（終了コード 3）"
+    ],
+    "壁": {
+      "書ける場所": [
+        "/Users/Shared/declared-plfq2te4/work",
+        "/private/var/folders/dn/s9s1c6fx3vq7l4mqy2l2y5sc0000f2/T"
+      ],
+      "出られる先": [],
+      "読ませない": [
+        "/Users/USER/.ssh",
+        "/Users/USER/.aws",
+        "/Users/USER/.gnupg",
+        "/Users/USER/Library/Keychains",
+        "/Users/USER/.openclaw/.env",
+        "/Users/USER/.openclaw/state",
+        "/Users/Shared/declared-plfq2te4/records"
+      ],
+      "読める場所": [
+        "/Users/Shared/declared-plfq2te4/work",
+        "/private/var/folders/dn/s9s1c6fx3vq7l4mqy2l2y5sc0000f2/T"
+      ],
+      "CPU秒": 1200,
+      "壁時計秒": 1800,
+      "1ファイル上限": 2097152,
+      "開けるファイル数": 512,
+      "増やせるバイト": 104857600,
+      "増やせるファイル数": 1000
+    },
+    "触った跡": true,
+    "見込み": "ふつう",
+    "居座り": {
+      "見つけた": [],
+      "殺した": [],
+      "探せない": "走りのあとに生まれた置き去り 3 本は、掴んでいる場所を見られなかった（別の持ち主）",
+      "皆殺し": "打った"
+    },
+    "証明の古さ": null,
+    "出力の長さ": 0,
+    "形式版": 2,
+    "期待": {
+      "取得状態": "取得済み",
+      "結果": {
+        "判定": "失敗",
+        "終了コード": 3,
+        "差分": {
+          "追加": [
+            "out"
+          ],
+          "削除": [],
+          "変更": []
+        }
+      },
+      "宣言者": "コマンドの --期待（/Users/Shared/declared-plfq2te4/expect.json）",
+      "宣言した時刻": 1790462228.006309
+    },
+    "実測": {
+      "起動資料": {
+        "取得状態": "取得済み",
+        "guardrun_sha256": "bc53fc65b1be21a9c1adc5620450591e6346874b014b6daa4f632d788e0d6b43",
+        "執行": "別ユーザ (uid 分離) + sandbox-exec (macOS)",
+        "OS": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "python": "3.14.6",
+        "uid": 501,
+        "gid": 20,
+        "umask": 18,
+        "呼び出し": [
+          "/Users/USER/bin/guardrun.py",
+          "--証明なし",
+          "--期待",
+          "/Users/Shared/declared-plfq2te4/expect.json",
+          "/Users/Shared/declared-plfq2te4/work",
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-c",
+          "import sys;open('out','w').write('partial');sys.exit(3)"
+        ]
+      },
+      "初期資料": {
+        "取得状態": "取得済み",
+        "参照": "/Users/Shared/declared-plfq2te4/records/runs/20260927-073707-20618-a3fe7a/初期資料.tar.gz",
+        "sha256": "a14d3e387cd3c8b2f9c2aeab2f377d833a5398b9b4480a062167061193b47cc9",
+        "件数": 1,
+        "バイト": 8,
+        "欠落": [],
+        "秒": 0.001,
+        "持たないもの": [
+          "ACL",
+          "拡張属性",
+          "ハードリンクの対応"
+        ]
+      },
+      "段階": "/Users/Shared/declared-plfq2te4/records/runs/20260927-073707-20618-a3fe7a/段階.jsonl"
+    },
+    "事後": {
+      "照合": {
+        "結果": "一致",
+        "食い違い": [],
+        "見た項目": [
+          "判定",
+          "終了コード",
+          "差分.追加",
+          "差分.削除",
+          "差分.変更"
+        ]
+      }
+    },
+    "状態": "終了",
+    "終わった": 1790462228.299304,
+    "終わった時刻": "2026-09-27T07:37:08"
+  },
+  "cli_exit": 3,
+  "stderr": "",
+  "passed": true
+}

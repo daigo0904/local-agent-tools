@@ -1,0 +1,32 @@
+{
+  "A": {
+    "attacks": 12,
+    "attack_operation_denied": 0,
+    "legitimate": 12,
+    "legitimate_completed": 12,
+    "legitimate_red_receipts": 0,
+    "median_all_seconds": 0.00817221647594124,
+    "median_legitimate_seconds": 0.00795694749103859
+  },
+  "B": {
+    "attacks": 12,
+    "attack_operation_denied": 0,
+    "legitimate": 12,
+    "legitimate_completed": 12,
+    "legitimate_red_receipts": 6,
+    "median_all_seconds": 0.11308665596880019,
+    "median_legitimate_seconds": 0.11308665596880019
+  },
+  "C": {
+    "attacks": 12,
+    "attack_operation_denied": 12,
+    "legitimate": 12,
+    "legitimate_completed": 12,
+    "legitimate_red_receipts": 6,
+    "median_all_seconds": 0.11104384099598974,
+    "median_legitimate_seconds": 0.10799399399547838
+  },
+  "C_B_legitimate_ratio": 0.9549667294545624,
+  "log_bytes": 109444,
+  "log_sha256": "34df08812ee30edc8f3c669901b297f0b05178bf6e7cbe2bf52a040de64927c9"
+}

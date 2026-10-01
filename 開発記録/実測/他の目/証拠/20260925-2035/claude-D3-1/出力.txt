@@ -1,0 +1,11 @@
+59 of the 60 files in `data/` are now UTF-8. One file, `037.txt`, can't be converted without changing its text, so I left it as it was.
+
+- **The 59 converted files:** For each one, I converted the UTF-8 back to Shift_JIS and got exactly the original bytes, so no characters changed. All 59 now read as valid UTF-8.
+- **Why `037.txt` was left alone:** Right after "記録 37 番。", at byte 12, it contains the bytes `0x85 0xFF`. That pair isn't a character in Shift_JIS or in CP932, the Windows variant. Every other file (for example `036.txt`) has "東京都…" at that position, so these 2 bytes look like extra, corrupted data. Deleting them or replacing them with "�" would change the text, which you asked me not to do.
+
+To finish it, choose one:
+1. Delete the 2 bytes and convert. The file would then match the others' pattern, "記録 37 番。東京都千代田区…".
+2. Replace the bytes with the replacement character "�" and convert.
+3. Get an intact copy of the original and convert that.
+
+結果: 未達
