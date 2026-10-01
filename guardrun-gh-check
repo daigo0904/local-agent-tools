@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""guardrun-gh-check — 今の ~/bin の guardrun を、GitHub の別の OS で1コマンドで確かめる。
+
+    guardrun-gh-check windows            今の版だけ（Windows の枠を節約する既定）
+    guardrun-gh-check windows --対照      基準の版も同じ run で走らせて並べる
+    guardrun-gh-check ubuntu             特権なし Ubuntu 22.04（bwrap＋別ユーザ）
+    guardrun-gh-check windows --何が未検証  送らずに、基準から後の guardrun の変更だけ出す
+
+**やること**
+  1. ~/bin の guardrun 一式を private repo（guardrun-portability）へ送る
+  2. gh-check.yml を dispatch して終わるまで待つ
+  3. 壁の証明（○★）と印の試験を、**基準**（その OS で最後に通した版の結果）と並べる
+
+**基準は自分で覚えない。**GitHub に残っている「その OS の gh-check の最後の成功」から引き、
+そのとき送った guardrun.py の指紋を ~/bin の履歴と突き合わせて、どのコミットかを特定する。
+別のセッションが Windows を回していても、基準がずれない。
+
+2026-09-24、Windows の枠（GitHub Actions の分数）を使い切った日に作った。
+枠が戻ったら `guardrun-gh-check windows` を打てば、その日のうちの変更がまとめて確かめられる。
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+REPO = "ahogorirappa/guardrun-portability"
+CLONE = os.path.expanduser("~/.cache/guardrun-portability")
+BIN = os.path.expanduser("~/bin")
+送る = ["guardrun.py", "guardrun-印の試験", "guardrun-窓の用意の試験", "guardrun-窓のCPUの試験", "guardlib.py", "schedlib.py", "modellib.py", "netlib.py"]
+OS名 = {"windows": "windows-2025", "ubuntu": "ubuntu-22.04"}
+WORKFLOW = "gh-check.yml"
+
+WORKFLOW_本文 = r"""name: gh-check
+# guardrun-gh-check が dispatch する。**判定はここに持たない**（中身は --verify と印の試験そのもの）。
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: windows-2025 / ubuntu-22.04
+        required: true
+      before:
+        description: 基準の版も走らせるか（true/false）
+        required: false
+        default: "false"
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        ver: ${{ fromJSON(inputs.before == 'true' && '["now","before"]' || '["now"]') }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: 基準の版に戻す
+        if: matrix.ver == 'before'
+        shell: bash
+        run: cp bin/guardrun-before.py bin/guardrun.py
+      - name: 版の確認
+        shell: bash
+        run: |
+          echo "【OS】${{ inputs.os }}"
+          python -c "import hashlib;print('指紋', hashlib.sha256(open('bin/guardrun.py','rb').read()).hexdigest()[:12])"
+      - name: 用意（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo useradd -r -M -s /bin/sh _guardrun || true
+          sudo chmod 755 /home/runner
+      - name: 用意（Windows）
+        if: runner.os == 'Windows'
+        run: python bin/guardrun.py --壁の利用者を作る
+      - name: 証明
+        continue-on-error: true
+        shell: bash
+        run: python bin/guardrun.py --verify 2>&1 | sed 's/^/【証明】/'
+      - name: 印の試験
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: PYTHONPATH=bin python bin/guardrun-印の試験 bin/guardrun.py 2>&1 | sed 's/^/【印】/'
+"""
+
+
+def sh(*a, **kw):
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    return subprocess.run(list(a), **kw)
+
+
+def 指紋(b):
+    return hashlib.sha256(b).hexdigest()[:12]
+
+
+def binの履歴の指紋():
+    """{指紋: コミット} を ~/bin の guardrun.py の履歴から作る。"""
+    表 = {}
+    for c in sh("git", "-C", BIN, "log", "--format=%h", "--", "guardrun.py").stdout.split():
+        b = subprocess.run(["git", "-C", BIN, "show", "%s:guardrun.py" % c],
+                           capture_output=True).stdout
+        表.setdefault(指紋(b), c)
+    return 表
+
+
+def 最後の成功(os名):
+    """その OS の gh-check の最後の成功 run → (run id, 送った guardrun の指紋, 結果の行)。"""
+    r = sh("gh", "run", "list", "-R", REPO, "-w", WORKFLOW, "-L", "30",
+           "--json", "databaseId,conclusion,displayTitle,headSha")
+    if r.returncode != 0:
+        return None
+    for x in json.loads(r.stdout or "[]"):
+        if x.get("conclusion") != "success":
+            continue
+        log = sh("gh", "run", "view", str(x["databaseId"]), "-R", REPO, "--log").stdout
+        if "【OS】%s" % os名 not in log:
+            continue
+        結果 = 読む(log, "now")
+        if 結果["指紋"]:
+            return x["databaseId"], 結果["指紋"], 結果
+    return None
+
+
+def 読む(log, ver):
+    """run のログから、その腕（now/before）の 指紋・証明・印 を取り出す。"""
+    出 = {"指紋": None, "証明": {}, "印": None, "印の落ち": []}
+    for l in log.splitlines():
+        頭 = l.split("\t")[0]
+        if "(%s" % ver not in 頭 and "(%s)" % ver not in 頭:
+            continue
+        本文 = re.sub(r"^.*?\d{4}-\d\d-\d\dT[\d:.]+Z ", "", l)
+        m = re.search(r"指紋 ([0-9a-f]{12})", 本文)
+        if m and not 出["指紋"] and "print(" not in 本文:
+            出["指紋"] = m.group(1)
+        m = re.match(r"【証明】\s+([○★])\s+(\S+)\s+(.*)", 本文)
+        if m:
+            出["証明"][m.group(2)] = (m.group(1), m.group(3)[:80])
+        if 本文.startswith("【印】✗"):
+            出["印の落ち"].append(本文[len("【印】"):][:90])
+        m = re.match(r"【印】(\{.*\})", 本文)
+        if m:
+            try:
+                出["印"] = json.loads(m.group(1))
+            except ValueError:
+                pass
+    return 出
+
+
+def main():
+    引数 = sys.argv[1:]
+    if not 引数 or 引数[0] not in OS名:
+        print(__doc__)
+        return 2
+    os名 = OS名[引数[0]]
+    対照 = "--対照" in 引数
+
+    履歴 = binの履歴の指紋()
+    今 = open(os.path.join(BIN, "guardrun.py"), "rb").read()
+    今の指紋 = 指紋(今)
+    今のコミット = 履歴.get(今の指紋, "（未コミット）")
+    基 = 最後の成功(os名)
+    if 基:
+        基run, 基指紋, 基結果 = 基
+        基コミット = 履歴.get(基指紋, "（~/bin の履歴に無い版 %s）" % 基指紋)
+    else:
+        基run, 基指紋, 基結果, 基コミット = None, None, None, None
+    print("今の版: %s（指紋 %s）" % (今のコミット, 今の指紋))
+    print("基準  : %s" % ("%s（run %s）" % (基コミット, 基run) if 基 else
+                         "まだ無い（%s で gh-check が1回も通っていない）" % os名))
+    if 基 and 基コミット and not 基コミット.startswith("（"):
+        変更 = sh("git", "-C", BIN, "log", "--format=  %h %ad %s", "--date=format:%m-%d %H:%M",
+                  "%s..HEAD" % 基コミット, "--", "guardrun.py").stdout.rstrip()
+        print("基準から後の guardrun の変更（%s で未検証）:\n%s" % (os名, 変更 or "  なし"))
+    if "--何が未検証" in 引数:
+        return 0
+
+    # 送る
+    if not os.path.isdir(os.path.join(CLONE, ".git")):
+        sh("gh", "repo", "clone", REPO, CLONE, "--", "-q")
+    sh("git", "-C", CLONE, "pull", "-q", "--rebase")
+    for n in 送る:
+        if os.path.exists(os.path.join(BIN, n)):
+            shutil.copy2(os.path.join(BIN, n), os.path.join(CLONE, "bin", n))
+    if 対照:
+        if not 基 or 基コミット.startswith("（"):
+            print("対照に使う基準の版が ~/bin の履歴に無いので、--対照 は走らせられない")
+            return 2
+        b = subprocess.run(["git", "-C", BIN, "show", "%s:guardrun.py" % 基コミット],
+                           capture_output=True).stdout
+        open(os.path.join(CLONE, "bin", "guardrun-before.py"), "wb").write(b)
+    wf = os.path.join(CLONE, ".github", "workflows", WORKFLOW)
+    if not os.path.exists(wf) or open(wf).read() != WORKFLOW_本文:
+        open(wf, "w").write(WORKFLOW_本文)
+    sh("git", "-C", CLONE, "add", "-A")
+    sh("git", "-C", CLONE, "commit", "-q", "-m",
+       "gh-check: %s を %s で（%s）" % (今のコミット, os名, "対照あり" if 対照 else "今の版だけ"))
+    p = sh("git", "-C", CLONE, "push", "-q")
+    if p.returncode != 0:
+        print("push できない: %s" % p.stderr.strip()[:200])
+        return 1
+
+    # 走らせて待つ
+    始 = time.time()
+    d = sh("gh", "workflow", "run", WORKFLOW, "-R", REPO, "-f", "os=%s" % os名,
+           "-f", "before=%s" % ("true" if 対照 else "false"))
+    if d.returncode != 0:
+        print("dispatch できない: %s" % d.stderr.strip()[:300])
+        print("（Windows の枠が尽きていると、ここか、走り出してすぐの失敗で分かる）")
+        return 1
+    run_id = None
+    for _ in range(30):
+        time.sleep(4)
+        r = sh("gh", "run", "list", "-R", REPO, "-w", WORKFLOW, "-L", "1",
+               "--json", "databaseId,createdAt")
+        xs = json.loads(r.stdout or "[]")
+        if xs and time.mktime(time.strptime(xs[0]["createdAt"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone >= 始 - 60:
+            run_id = xs[0]["databaseId"]
+            break
+    if not run_id:
+        print("走りが見つからない（dispatch は通った）")
+        return 1
+    print("走らせた: run %s（待っています）" % run_id, flush=True)
+    sh("gh", "run", "watch", str(run_id), "-R", REPO)
+    log = sh("gh", "run", "view", str(run_id), "-R", REPO, "--log").stdout
+    concl = sh("gh", "run", "view", str(run_id), "-R", REPO, "--json", "conclusion",
+               "--jq", ".conclusion").stdout.strip()
+
+    # 並べる
+    腕 = {"now": 読む(log, "now")}
+    if 対照:
+        腕["before"] = 読む(log, "before")
+    if not 腕["now"]["証明"]:
+        注 = sh("gh", "run", "view", str(run_id), "-R", REPO).stdout
+        if re.search(r"spending limit|payments have failed", 注):
+            # 2026-09-24 実測: 枠が尽きると Windows だけでなく ubuntu も「始まらない」。
+            print("GitHub Actions の枠切れ（使用上限・支払い）で、走りが始まらなかった。"
+                  "\n  Windows だけでなく Linux も止まる。枠が戻るまでは手元の guardrun-crosstest の ④ で測る。")
+            return 3
+        print("証明の結果が1行も無い（結論 %s）。起動失敗を疑う。ログ: gh run view %s -R %s --log"
+              % (concl, run_id, REPO))
+        return 1
+    項目 = list(腕["now"]["証明"])
+    print("\n%-6s %-6s %-6s %s" % ("項目", "今", "対照" if 対照 else "基準", ""))
+    変わった = 0
+    for k in 項目:
+        今印 = 腕["now"]["証明"][k][0]
+        比 = (腕["before"]["証明"].get(k, ("-",))[0] if 対照
+              else (基結果["証明"].get(k, ("-",))[0] if 基結果 else "-"))
+        印 = "" if 比 in ("-", 今印) else "  ← 変わった"
+        変わった += bool(印)
+        print("%-6s %-6s %-6s %s%s" % (k, 今印, 比, 腕["now"]["証明"][k][1] if 今印 == "★" else "", 印))
+    for ver, x in 腕.items():
+        m = x["印"] or {}
+        print("印の試験 %s: %s/%s%s" % (ver, m.get("通った", "?"), m.get("全部", "?"),
+                                   ("  落ちた: " + "／".join(m.get("落ちた", [])[:5])) if m.get("落ちた") else ""))
+    print("\n○ %d ／ ★ %d ・ 基準から変わった項目 %d ・ run %s（%s）"
+          % (sum(v[0] == "○" for v in 腕["now"]["証明"].values()),
+             sum(v[0] == "★" for v in 腕["now"]["証明"].values()), 変わった, run_id, concl))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

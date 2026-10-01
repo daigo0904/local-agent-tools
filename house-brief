@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+house-brief — 見張りが見ていない隙間を、事実だけ集めて短く出す。
+
+    house-brief            気になることだけ出す。無ければ「静か」の1語
+    house-brief --notify   気になることがあれば Discord に送る（定時実行用）
+    house-brief --all      気にならないものも全部出す（人が見るとき用）
+    house-brief --forget   「一度言った」の記録を消す（試すとき用）
+
+## なぜ要るか
+
+見張り9本は、それぞれ**決定的な閾値**で判定している。そのほうが確実だからで、
+そこにモデルを混ぜるつもりはない。ただし閾値には、必ず隙間が残る。
+
+  - KV枠の圧は `/slots` に出ない。`ollama.log` の `cache state` 行にしかなく、
+    **その行はリクエストの切れ目でしか出ない**ので、誰も見ていない
+  - 定時の仕事が「失敗はしていないが、待ち行列で7分待たされた」を誰も数えていない
+  - SNS の下書きが承認されないまま溜まっても、誰も言わない
+  - トンネルが何回張り替わったかを誰も数えていない（2026-09-06 に6回起きた）
+
+ここは「閾値で書きにくいが、人が見れば分かる」たぐいなので、
+30分ごとに起きている心拍（heartbeat-main）に読ませて、
+**言う価値があるかだけモデルに決めさせる**。
+
+## この道具がやらないこと
+
+**直さない。止めない。何も書き換えない。**読むだけ。
+直す判断は見張り側にあり、そこは決定的なままにしておく。
+ここが直しはじめると、「見張りが信用できるのは判断が決定的だから」が崩れる。
+
+## 同じことを繰り返し言わない
+
+30分ごとに走るので、素朴に出すと同じ話が1日48回届く。
+一度言ったことは `~/.openclaw/house-brief-state.json` に控えて、
+**状況が変わるまで黙る**。
+"""
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, maintenance  # noqa: E402
+
+G = Guard("house-brief")
+# `--all` は読むだけ（控えにも触らない）。鍵を取らせない。
+G.LOOK_ONLY = Guard.LOOK_ONLY | {"--all"}
+
+OPENCLAW = os.path.expanduser("~/.openclaw")
+STATE = os.path.join(OPENCLAW, "house-brief-state.json")
+DB = os.path.join(OPENCLAW, "state", "openclaw.sqlite")
+OLLAMA_LOG = "/opt/homebrew/var/log/ollama.log"
+SYNC_LOG = os.path.join(OPENCLAW, "logs", "line-webhook-sync.log")
+SNS_QUEUE = os.path.join(OPENCLAW, "sns-queue.json")
+BIN = os.path.dirname(os.path.abspath(__file__))
+
+# 閾値。**ここは決定的でよい。**モデルに決めさせるのは「言うかどうか」だけで、
+# 「何が普通でないか」は数字で書ける。
+CACHE_PRESSURE = 90          # KV枠が何%を超えたら気にするか
+SLOW_RUN_SECONDS = 120       # 定時の仕事がこれより長ければ、待たされた疑い
+LOOKBACK_HOURS = 6           # どこまで遡って見るか
+TUNNEL_REBUILDS = 3          # この回数を超える張り替えは異常
+SNS_PENDING = 3              # 溜まった下書きの数
+LINE_QUOTA_LOW = 40          # LINE の残りがこれを切ったら
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(d):
+    tmp = STATE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def cache_pressure():
+    """KV枠がどれだけ埋まっているか。`cache state` 行にしか無い。"""
+    try:
+        with open(OLLAMA_LOG, errors="ignore") as f:
+            # 末尾だけ読む。このログは何百MBにもなる。
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 400_000))
+            lines = [l for l in f.read().splitlines() if "cache state" in l]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    m = re.search(r"(\d+) prompts, ([\d.]+) MiB \(limits: ([\d.]+) MiB", lines[-1])
+    if not m:
+        return None
+    prompts, used, limit = int(m.group(1)), float(m.group(2)), float(m.group(3))
+    return prompts, used, limit, used / limit * 100
+
+
+def slow_or_failed_runs():
+    """最近の定時の仕事で、落ちたもの・不自然に長かったもの。"""
+    since = int((datetime.now() - timedelta(hours=LOOKBACK_HOURS)).timestamp() * 1000)
+    out = []
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        rows = con.execute(
+            "select coalesce(j.name, r.job_id), r.status,"
+            "       (r.finished_at_ms - r.started_at_ms)/1000.0,"
+            "       datetime(r.started_at_ms/1000,'unixepoch','localtime')"
+            "  from cron_run_receipts r left join cron_jobs j on j.job_id = r.job_id"
+            " where r.started_at_ms > ? order by r.started_at_ms", (since,)).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return out
+    for name, status, secs, started in rows:
+        # **まだ走っているものを異常として数えない。**
+        # この道具を呼んでいるのは心拍そのものなので、素朴に `status != ok` で拾うと
+        # **実行中の自分自身**が必ず引っかかり、30分ごとに誤報が出続ける
+        # （2026-09-08、実際にそうなった）。終わったものだけを見る。
+        if status == "running":
+            continue
+        if status != "ok":
+            out.append(f"{name} が {status}（{started}）")
+        elif secs and secs >= SLOW_RUN_SECONDS:
+            out.append(f"{name} に {int(secs)}秒かかった（{started}・待ち行列の疑い）")
+    return out
+
+
+def tunnel_rebuilds():
+    """最近トンネルが何回張り替わったか。URLが変わるたび1回。"""
+    since = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
+    n = 0
+    try:
+        with open(SYNC_LOG, errors="ignore") as f:
+            for line in f:
+                if "URL変更を検知" not in line:
+                    continue
+                m = re.match(r"\[([\d-]+ [\d:]+)\]", line)
+                if m and datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") > since:
+                    n += 1
+    except (OSError, ValueError):
+        return None
+    return n
+
+
+def sns_pending():
+    """承認されないまま溜まっている下書きの数と、いちばん古いものの日付。"""
+    try:
+        with open(SNS_QUEUE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    items = d if isinstance(d, list) else d.get("items") or d.get("queue") or []
+    if not isinstance(items, list):
+        return None
+    return len(items)
+
+
+def line_quota_low():
+    """LINE の残り枠が少ないか。判定は line-quota に任せる。"""
+    q = os.path.join(BIN, "line-quota")
+    if not os.path.isfile(q):
+        return None
+    try:
+        r = subprocess.run([q, "--check", str(LINE_QUOTA_LOW)],
+                           capture_output=True, timeout=30)
+        return r.returncode != 0
+    except Exception:
+        return None
+
+
+AGENT_DB = os.path.expanduser(
+    "~/.openclaw/agents/main/agent/openclaw-agent.sqlite")
+
+
+def _近い(a, b):
+    """a が b の写し損ねに見えるか。**編集距離ではなく「前後は合っている」で見る。**
+
+    モデルの写し損ねは、途中が抜ける・途中が化ける形で出る（実測23件とも）。
+    前から一致する長さ ＋ 後ろから一致する長さ が、ほぼ全長に届いていれば
+    「同じものを写そうとして失敗した」と読む。まるで違う識別子は前後も合わない。"""
+    if a == b or abs(len(a) - len(b)) > 8:
+        return False
+    短 = min(len(a), len(b))
+    前 = 0
+    while 前 < 短 and a[前] == b[前]:
+        前 += 1
+    後 = 0
+    while 後 < 短 - 前 and a[-1 - 後] == b[-1 - 後]:
+        後 += 1
+    return (前 + 後) >= 短 - 8 and (前 + 後) >= 12
+
+
+def 写し損ね(hours=LOOKBACK_HOURS):
+    """長い識別子を写し損ねた道具呼び出し。[(道具, 使った, 正しい, 脱落)] を返す。
+
+    ■ なぜ要るか
+
+    gemma4:26b は37文字のランダム識別子を**確率的に**写し損ねる。
+    2026-09-09、`conv_…32f8e4de` を `conv_…3e4` と5文字落として
+    **26回中23回失敗**した。ところが2日後には同じ識別子を1文字も落とさずに写している。
+
+    **たまに通るものは、指示でも再試行でも潰れない。**だから
+    ①写す必要のある道具を外し（`tools.deny`）、②それでも起きたらここで見つける。
+
+    ■ 見分け方
+
+    **返りに出た識別子だけを「実在」とする。**返りは道具が書くので、モデルには書けない。
+    引数に出た識別子が、実在するもののどれにも一致せず、しかし**前後が合っている**なら
+    写し損ね。実測26件に当てて、23件（全部の失敗）を拾い、成功3件は拾わなかった。
+
+    ■ 罠
+
+    **`type` ではなく `role` が `toolResult`。**最初 `type` で探して0件になり、
+    「写し損ねは無い」と読みかけた（2026-09-14）。**空は「無い」ではなく「取れていない」。**
+    """
+    if not os.path.exists(AGENT_DB):
+        return []
+    cutoff = (datetime.now() - timedelta(hours=hours)).timestamp() * 1000
+    try:
+        con = sqlite3.connect(f"file:{AGENT_DB}?mode=ro", uri=True, timeout=3)
+        rows = list(con.execute(
+            "select created_at, event_json from transcript_events order by seq"))
+        con.close()
+    except Exception:
+        return []
+
+    実在, 使った = set(), []
+    for at, js in rows:
+        if "conv_" not in js:
+            continue
+        try:
+            m = (json.loads(js).get("message") or {})
+        except ValueError:
+            continue
+        本文 = json.dumps(m, ensure_ascii=False)
+        if m.get("role") == "toolResult" and '"conversationRef"' in 本文:
+            実在.update(re.findall(r"\b(conv_[0-9a-zA-Z]{10,})\b", 本文))
+        if m.get("role") == "assistant":
+            for c in (m.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "toolCall":
+                    a = json.dumps(c.get("arguments") or {}, ensure_ascii=False)
+                    for x in re.findall(r"\b(conv_[0-9a-zA-Z]{10,})\b", a):
+                        使った.append((at, c.get("name"), x))
+
+    出 = []
+    for at, 名, x in 使った:
+        if x in 実在 or (at or 0) < cutoff:
+            continue
+        元 = [r for r in 実在 if _近い(x, r)]
+        if 元:
+            出.append((名, x, 元[0], len(元[0]) - len(x)))
+    return 出
+
+# 完了を語る言い回し。**未来形は入れない**（「直します」は予告であって主張ではない）。
+完了語 = re.compile(r"(しました|完了|できました|終わりました|済みました)")
+
+# 同じ道具が続けて失敗した回数がこれ以上なら、前提が違うまま回っている。
+# **実測の分布で決めた**（会話57件・道具を使ったもの）:
+#   連続失敗 0回 …46件 / 1回 …7件 / 2回 …1件 / 4回 …1件 / 6回 …1件 / 22回 …1件
+# 4以上の3件はすべて本物だった——写し損ねのループ・8時間25分の捏造・
+# 権限が無いのに4回挑んだ回。**3以下は1件も事故ではない。**
+連続失敗の上限 = 4
+
+
+def _会話ごとの跡(hours):
+    """(会話 → 呼び出しと発言の並び, 呼び出しid → 失敗か) を返す。
+
+    **`type` ではなく `role` を見ること。**道具の返りは
+    `{"type":"message","message":{"role":"toolResult",...}}` の形で入っている。"""
+    if not os.path.exists(AGENT_DB):
+        return {}, {}
+    cutoff = (datetime.now() - timedelta(hours=hours)).timestamp() * 1000
+    try:
+        con = sqlite3.connect(f"file:{AGENT_DB}?mode=ro", uri=True, timeout=3)
+        rows = list(con.execute(
+            "select session_id, created_at, event_json from transcript_events order by seq"))
+        con.close()
+    except Exception:
+        return {}, {}
+    並び, 結果 = {}, {}
+    for sid, at, js in rows:
+        try:
+            m = (json.loads(js).get("message") or {})
+        except ValueError:
+            continue
+        役 = m.get("role")
+        if 役 == "toolResult":
+            結果[m.get("toolCallId")] = bool(m.get("isError"))
+            continue
+        if 役 != "assistant" or (at or 0) < cutoff:
+            continue
+        中 = m.get("content")
+        呼 = [c for c in 中 if isinstance(c, dict) and c.get("type") == "toolCall"] \
+            if isinstance(中, list) else []
+        文 = 中 if isinstance(中, str) else "".join(
+            x.get("text", "") for x in (中 or []) if isinstance(x, dict) and x.get("type") == "text")
+        for c in 呼:
+            並び.setdefault(sid[:8], []).append(("呼", c.get("id"), c.get("name")))
+        if 文.strip():
+            並び.setdefault(sid[:8], []).append(("言", 文, None))
+    return 並び, 結果
+
+
+def 失敗の繰り返し(hours=LOOKBACK_HOURS):
+    """同じ道具が続けて失敗しているのに、やめない会話。[(会話, 道具, 回数)]。
+
+    ■ これが「幻覚の自己強化ループ」の見える形
+
+    心拍は元気、プロセスも生きている、しかし**前提が違うまま回り続ける**。
+    空回りの検知（同じ引数の繰り返し）とは別物で、**失敗しているのに続ける**ほうを見る。
+    失敗は成功より強い信号なので、繰り返しの回数は少なくてよい。
+
+    実測で拾えた3件はどれも本物だった。
+      3aab972c  22回  写せない識別子を送り続けた
+      7e2888e5   6回  同じ find が5回失敗したあと、作業を完了したと語った
+      219d4f5b   4回  「実行の承認が設定されていない」に4回挑んだ（設定を直さない限り永久に失敗する）
+    """
+    並び, 結果 = _会話ごとの跡(hours)
+    出 = []
+    for s, seq in 並び.items():
+        最長, 連, 前 = 0, 0, None
+        道具 = None
+        for k, v, n in seq:
+            if k != "呼":
+                continue
+            if 結果.get(v) and n == 前:
+                連 += 1
+            elif 結果.get(v):
+                連, 前 = 1, n
+            else:
+                連, 前 = 0, None
+            if 連 > 最長:
+                最長, 道具 = 連, 前
+        if 最長 >= 連続失敗の上限:
+            出.append((s, 道具, 最長))
+    return sorted(出, key=lambda x: -x[2])
+
+
+def やっていないのに言う(hours=LOOKBACK_HOURS):
+    """最後の道具呼び出しが失敗しているのに、完了を語った会話。[(会話, 道具, 文)]。
+
+    ■ 捏造の、決定的に見える形
+
+    2026-09-11 の8時間25分は、`find ~/bin -type f` が5回続けて失敗したあと、
+    **「解析・修正プロセス」を語る長文で終わった**。sudo は一度も実行していない。
+
+    **中身を解釈しない。**「何をやったと言っているか」を読もうとすると、
+    判定にモデルが要る。この家は見張りに判断を入れない決まりなので、
+    **「直前の道具が失敗しているか」という事実だけ**で見る。
+    実測で会話111件に当てて、**1件**（その捏造そのもの）だけを拾った。
+    """
+    並び, 結果 = _会話ごとの跡(hours)
+    出 = []
+    for s, seq in 並び.items():
+        最後, 直前 = None, None
+        for k, v, n in seq:
+            if k == "呼":
+                直前 = (v, n)
+            else:
+                最後 = (v, 直前)
+        if not 最後 or not 最後[1]:
+            continue
+        文, (cid, 道具) = 最後
+        if 結果.get(cid) and 完了語.search(文):
+            出.append((s, 道具, 文.strip().splitlines()[0][:70]))
+    return 出
+
+def collect():
+    """(気になること, 全部の観測) を返す。"""
+    notable, seen = [], []
+
+    c = cache_pressure()
+    if c:
+        prompts, used, limit, pct = c
+        seen.append(f"KV枠 {used:.0f}/{limit:.0f} MiB（{pct:.0f}%・{prompts}件）")
+        if pct >= CACHE_PRESSURE:
+            notable.append(
+                ("cache", f"頭脳のキャッシュ枠が {pct:.0f}% 埋まっている"
+                          f"（{used:.0f}/{limit:.0f} MiB・{prompts}件）。"
+                          f"これは /slots には出ないので、ほかの誰も見ていない"))
+
+    runs = slow_or_failed_runs()
+    seen.append(f"定時の仕事（直近{LOOKBACK_HOURS}時間）: 気になるもの {len(runs)}件")
+    for r in runs:
+        notable.append((f"run:{r[:40]}", r))
+
+    t = tunnel_rebuilds()
+    if t is not None:
+        seen.append(f"トンネルの張り替え（直近{LOOKBACK_HOURS}時間）: {t}回")
+        if t > TUNNEL_REBUILDS:
+            notable.append(("tunnel", f"LINEのトンネルが{LOOKBACK_HOURS}時間で{t}回張り替わっている"
+                                      f"（URLも同じ回数変わった）"))
+
+    s = sns_pending()
+    if s is not None:
+        seen.append(f"SNS の承認待ち: {s}件")
+        if s >= SNS_PENDING:
+            notable.append(("sns", f"SNS の下書きが {s}件 承認待ちのまま溜まっている"))
+
+    ループ = 失敗の繰り返し()
+    seen.append(f"同じ失敗の繰り返し {len(ループ)}件（直近{LOOKBACK_HOURS}時間）")
+    if ループ:
+        会, 道, 回 = ループ[0]
+        notable.append(("loopfail",
+                        f"同じ道具が続けて失敗しているのに、やめていない会話が {len(ループ)}件"
+                        f"（{会}・{道} が {回}回続けて失敗）。"
+                        f"**前提が違うまま回っている疑い**——心拍もプロセスも元気に見える"))
+
+    捏造 = やっていないのに言う()
+    seen.append(f"やっていないのに完了と言った {len(捏造)}件（直近{LOOKBACK_HOURS}時間）")
+    if 捏造:
+        会, 道, 文 = 捏造[0]
+        notable.append(("claim",
+                        f"最後の道具（{道}）が失敗しているのに、完了を語った会話が {len(捏造)}件"
+                        f"（{会}）。「{文}…」"))
+
+    m = 写し損ね()
+    seen.append(f"識別子の写し損ね {len(m)}件（直近{LOOKBACK_HOURS}時間）")
+    if m:
+        名, 使, 正, 落 = m[0]
+        notable.append(("miscopy",
+                        f"長い識別子の写し損ねが {len(m)}件（{名}）。"
+                        f"{使} と書いたが、正しくは {正}（{落}文字 脱落）。"
+                        f"**モデルは確率的に写し損ねるので、指示や再試行では潰れない**"))
+
+    q = line_quota_low()
+    if q is not None:
+        seen.append(f"LINE の残り枠: {'少ない' if q else '足りている'}")
+        if q:
+            notable.append(("line", f"LINE の残り送信数が {LINE_QUOTA_LOW} 通を切った"))
+
+    return notable, seen
+
+
+def main():
+    if "--forget" in sys.argv:
+        try:
+            os.unlink(STATE)
+        except OSError:
+            pass
+        print("控えを消しました")
+        return 0
+
+    notable, seen = collect()
+
+    if "--all" in sys.argv:
+        print("いま見えているもの:")
+        for s in seen:
+            print(f"  {s}")
+        print()
+        print("気になること:" if notable else "気になることはありません")
+        for _, text in notable:
+            print(f"  ! {text}")
+        return 0
+
+    # 一度言ったことは、状況が変わるまで繰り返さない。
+    state = load_state()
+    told = state.get("told") or {}
+    fresh = [(k, t) for k, t in notable if k not in told]
+
+    now = datetime.now().isoformat(timespec="seconds")
+    save_state({"told": {k: told.get(k, now) for k, _ in notable}, "at": now})
+
+    if not fresh:
+        print("静か")
+        return 0
+
+    for _, text in fresh:
+        print(text)
+
+    # **定時で回すときだけ知らせる。**手で打ったときに勝手に送らない。
+    #
+    # 2026-09-11、この道具は呼ばれなくなって32時間止まった。心拍（heartbeat-main）に
+    # 読ませる設計だったが、「心拍のたびに呼ぶ」は**会話の中にしか書いていなかった**ので、
+    # 心拍を軽くした（isolatedSession）日に約束ごと消えた。gateway は ok を返し続け、
+    # 気づいたのは翌日の点呼だけだった。→ **モデルを通さず launchd から回す**形にした
+    # （ai.openclaw.house-brief・3時間ごと）。続いてほしいことを会話に置かない。
+    if "--notify" in sys.argv:
+        held, why = maintenance()
+        if held:
+            # **読むのは通し、送るのだけ止める。**手入れ中は、直している当人が
+            # 起こしていることを本人に鳴らし返すだけになる。
+            print(f"（手入れ中なので知らせは送らない: {why}）")
+        else:
+            G.notify("見張りが見ていない隙間で、気になることがあります。\n"
+                     + "\n".join(f"・{t}" for _, t in fresh)
+                     + "\n詳しくは: house-brief --all")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

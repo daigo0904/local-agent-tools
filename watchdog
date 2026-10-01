@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""
+watchdog — 見張りたちと本体が「黙っていないか」を見る。
+
+60秒おきに走らせる前提（plist の StartInterval と INTERVAL_S を一致させること）。
+普段は何もせず、何もしなかったことも報告しない。
+直したときと、直せなかったときだけ Discord に一言送る。
+
+    watchdog              点検して、必要なら直す（普段は無言）
+    watchdog --report     問題がなくても今の状態を表示する
+    watchdog --dry-run    調べるだけで直さない
+    watchdog --check      OK/NG だけ返す
+
+見ているもの:
+  1. model-guard が走り続けているか（心拍の新しさ）
+  2. gateway が「立っているのに黙って」いないか
+  3. 自分の心拍を残す（model-guard がこれを見て、こちらの死に気づく）
+
+なぜ見張りの見張りが要るか:
+  model-guard がひとつだけの砦になっている。それが黙ったら誰も気づかない。
+  launchd は plist が読み込まれている限り繰り返し起動してくれるが、
+  スクリプトが毎回落ちる・plist が外れる・設定を壊す、のどれでも
+  「起動はしているのに一度も仕事をしていない」状態になる。
+  だから「立ち上がったか」ではなく「走り切った跡」を見る。
+
+なぜ相互監視で止めるか:
+  見張りの見張りにも見張りが要る、で切りがない。
+  1台のMacで打てる手は「2つが互いを見る」までで、そこから先
+  （両方同時に黙る・Macごと落ちる）は外の機械にしか気づけない。
+  できないことははっきり分けて、ここでは扱わない。
+
+なぜ gateway をポートで見ないか:
+  ポートは line-guard が見ていて、閉じていれば起こす。担当が重なると
+  2つが同時に入れ直して傷を広げるので、こちらは見ない。
+  こちらが見るのは「開いているのに答えない」ほうだけ。
+
+なぜ openclaw を絶対パスで、PATH を足して呼ぶか:
+  launchd が渡す PATH は /usr/bin:/bin:/usr/sbin:/sbin しかない。
+  openclaw は /opt/homebrew/bin にあり、中身も `#!/usr/bin/env node` なので、
+  そのまま呼ぶと `env: node: No such file or directory` で必ず失敗する。
+  見張りが黙って無力になる典型なので、ここで潰しておく。
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+# 見張りが共有する部品。同じものを4つに書き写していたが、
+# 書き写した当日に編集で1つ壊し、説明文もずれていた。
+# 独立を支えているのは別プロセス・別の時計・別の判断であって、
+# 同じ文字列を別々に持つことではない。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import (Guard, env_value, maintenance, pulse_age,  # noqa: E402
+                      kickstart, restart_service, settling, trim_file)
+
+G = Guard("watchdog")
+
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+PLIST_DIR = os.path.expanduser("~/Library/LaunchAgents")
+
+OPENCLAW = "/opt/homebrew/bin/openclaw"
+BREW_BIN = "/opt/homebrew/bin"
+GATEWAY_PORT = 18789
+GATEWAY_LOG = os.path.expanduser("~/Library/Logs/openclaw/gateway.log")
+GATEWAY_LABEL = "ai.openclaw.gateway"
+MODEL_GUARD_LABEL = "ai.openclaw.model-guard"
+LINE_GUARD_LABEL = "ai.openclaw.line-guard"
+QWC_GUARD_LABEL = "ai.openclaw.qwc-guard"
+GUARD_DRILL_LABEL = "ai.openclaw.guard-drill"
+LOOP_GUARD_LABEL = "ai.openclaw.loop-guard"
+
+# ── 何秒おきに走るか ──────────────────────────────────────
+#
+# **plist の StartInterval と必ず一致させること。**
+# ここは説明文に「5分おき」、定数のところに「3分おき」と書いてあり、
+# plist は60秒だった。3つとも違っていた。おかげで
+#   「答えないなら6分、詰まっているだけなら9分待つ」と書いてある段取りが、
+#   実際には 2分 と 3分 で動いていた。**待つつもりの余裕が1/3しかなかった。**
+# 以下、回数ではなく分で決めて、ここで回数に直す。
+# 訓練（guard-drill）が、この値と plist が食い違っていないかを毎日見る。
+INTERVAL_S = 60
+
+
+def rounds(minutes):
+    """「何分待つ」を「何回続けてダメだったら」に直す。"""
+    return max(1, round(minutes * 60 / INTERVAL_S))
+
+
+HEALTH_TIMEOUT = 30
+# model-guard は60秒おき。点検そのものに最大60秒かかるので、数回ぶん見送っても
+# まだ余裕がある長さにする。短くすると、ollama が重い日に誤って蹴ってしまう。
+MODEL_GUARD_STALE = 400
+# line-guard は5分おき。トンネルを張り直す回は数分かかるので、3回ぶん見ておく。
+LINE_GUARD_STALE = 1100
+# qwc-guard は1日1回。Mac が寝ていた日もあるので、丸一日半までは待つ。
+QWC_GUARD_STALE = 30 * 3600
+# 訓練は1日1回（05:30）。Mac が寝ていた日を数えて、3日ぶん見送っても騒がない。
+#
+# **ここを見ているのは、見張りの網の最後の穴だから。**
+# 見張りは互いの心拍を見ているので「止まった」は捕まえられる。捕まえられないのは
+# 「走ってはいるが、もう壊れ方を見分けられなくなっている」ほう。それを試すのが訓練で、
+# 訓練が走らなくなると、**その日から誰も見張りの正しさを確かめていない**ことになる。
+GUARD_DRILL_STALE = 3 * 24 * 3600
+# loop-guard は2分おき。数回ぶん見送っても騒がない長さにする。
+#
+# **ここを見ているのは、この見張りだけが「止まらないもの」を探しているから。**
+# ほかの見張りは全員「止まったもの」を探す。2026-09-11 の8時間25分は、
+# 2分おきに道具を呼び続けていたので**全員から忙しく見えていた**。
+# loop-guard が黙ると、その穴がそのまま開く。
+LOOP_GUARD_STALE = 600
+
+# ── 点呼（silence） ──────────────────────────────────────
+# **上の5本は手で名前を書いてある。**だから、明日1本足すと誰にも見られない。
+# 2026-09-12 に数えたら、launchd の16本のうち7本は跡を1つも残しておらず、
+# 心拍を残す13本のうち7本は誰も見ていなかった（openclaw-update は5日前、
+# house-brief は27時間前で、どちらも誰も何も言っていない）。
+#
+# 点呼は台帳を **launchd と gateway から生やす** ので、登録した瞬間に載る。
+# ここでは **上の5本が構造的に見られないもの** だけを引き取る。
+#   ・走ったのに走り切れていない（launchd は走らせたのに心拍が古い）
+#   ・launchd を通らずに心拍だけ新しい
+#   ・前回 exit が 0 でない
+#   ・誰も期限を決めていない
+#   ・上の5本に入っていない仕事の黙り／落ち
+# **黙りのうち5本ぶんは引き取らない。**wake() と二重に鳴らすと、
+# 直す側が2人になって殴り合う（2026-08-31 の事故がその形）。
+点呼の担当外 = ("model-guard", "line-guard", "qwc-guard", "guard-drill",
+                "loop-guard", "gateway")
+
+# gateway を入れ直すまでに、何分ダメが続いたら動くか。
+#
+# 入れ直すと Discord と LINE の受け口がいったん落ちる。
+# 一度の失敗で落とすと、直すつもりで切っていることになるので、必ず続けて見る。
+SILENT_BEFORE_RESTART = rounds(6)      # 答えないなら6分
+DEGRADED_BEFORE_RESTART = rounds(9)    # 詰まっているだけなら9分（自分で戻ることがある）
+# gateway が「落ちたまま」のときに、こちらが手を出すまでの回数。
+#
+# 本来これは line-guard の担当で、あちらは5分おきに起こしにいく。
+# だから普通は3回も続かない。続くということは line-guard 自身が
+# 黙っているということなので、そのときだけ肩代わりする。
+# 担当を分けたままにすると「line-guard が死なない前提」の設計になってしまう。
+DOWN_BEFORE_RESTART = rounds(9)
+
+# これだけ黙ったら、まだ直している途中でも知らせる。
+# 復旧は3〜5分で終わらせる前提なので、それを超えたら異常事態として扱う。
+# 「30分止まっていました」と後から知るのが一番困る。
+TELL_AFTER = 5 * 60
+# 入れ直したあと、次に入れ直してよくなるまでの間。
+RESTART_COOLDOWN = 900
+
+
+
+
+
+def restart_gateway(wait=30, min_gap=60):
+    """入れ直して、**本当に戻ったかどうかを確かめてから**返す。
+
+    gateway は常駐なので restart_service を使う（走っていても殺して入れ直す）。
+    見張りに使う kickstart は「走っている相手には手を出さない」ので、
+    こちらに使うと**いちばん直したい「立っているのに黙っている」場面で
+    何もしなくなる**。用途が逆なので、取り違えないこと。"""
+    # **返りを捨てないこと。**`restart_service` は「60秒前に入れ直したばかり」
+    # のとき `("waiting", …)` を返して**何もしない**。それを捨てて待つと、
+    # 蹴っていないのに「上がらない」と報告することになる
+    # ——**症状を原因のように言う**、この家がいちばん嫌う形である。
+    # 2026-09-13 実測: `rollback_config` は必ず「入れ直しが失敗した直後」に
+    # 走るので、この待ち合わせに毎回引っかかり、**一度も蹴らずに**
+    # 「戻したが、それでも上がらない」と書いていた。
+    どう, なぜ = restart_service(GATEWAY_LABEL, min_gap=min_gap)
+    if どう == "waiting":
+        G.log(f"gateway を入れ直していない（{なぜ}）")
+        return False
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if port_open(GATEWAY_PORT):
+            return True
+        time.sleep(1)
+    return False
+
+
+def rollback_config():
+    """設定を「動いた形」に戻して、もう一度入れ直す。
+
+    入れ直しても戻らないときの次の手。原因の多くは設定なので、
+    決めてある形に戻すのが、いちばん確実で結果の読める手当てになる。
+    config-guard が戻す前のものも残すので、あとから原因を追える。
+
+    **判断で直そうとしない。**ここは「決めてある形に戻す」だけにする。
+    考えて直すのは、この先の段で人か qwc がやること。"""
+    guard = os.path.expanduser("~/bin/config-guard")
+    if not os.path.exists(guard):
+        return False, "config-guard が無い"
+    # **timeout= を付けたら TimeoutExpired を受けること。**
+    # 受けていないと例外がそのまま上がり、点検の最後にある save_state も beat も
+    # 実行されない。**生きているのに心拍を残さずに死ぬ**ので、相手はそれを
+    # 「死んだ」と読んで蹴りにくる。2026-08-31 の蹴り合いはここからでも始められた。
+    try:
+        # **`--stop-gateway` が要る。**2026-09-06 に config-guard へ
+        # 「ゲートウェイが登録されたままなら戻さない」を足した。起動に失敗する
+        # gateway は死ぬ前に設定を自分の形へ書き直すので、外さずに書いても
+        # 消える——正しい振る舞いである。**だがこちらを合わせ忘れていた。**
+        # そのため 2026-09-06 以降、**この最後の手当ては一度も成功しない**
+        # 状態だった（2026-09-12、guard-drill config が2回とも捕まえた）。
+        # 外したあとの登録し直しは restart_gateway が持っている
+        # （kickstart が失敗したら bootstrap で読み込み直す）。
+        r = subprocess.run([guard, "--rollback", "--stop-gateway", "--quiet"],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"config-guard を呼べなかった（{type(e).__name__}）"
+    if r.returncode != 0:
+        # **理由を作らない。**「動いた形がまだ無い可能性」と決め打ちしていたので、
+        # 拒否されていた本当の理由（登録されたまま）が6日間見えなかった。
+        言い分 = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        return False, "戻せなかった（%s）" % (
+            言い分[-1].strip()[:80] if 言い分 else "config-guard が理由を返さない")
+    # **ここでは待ち合わせを外す（min_gap=0）。**この道は「入れ直しが
+    # 効かなかったので設定を戻した」という別の手当てであって、入れ直しの
+    # 連打ではない。既定の60秒を効かせると、**巻き戻しは永久に起こし直せない**
+    # （必ず入れ直しの直後に来るので）。
+    if not restart_gateway(90, min_gap=0):
+        return False, "戻したが、それでも上がらない"
+    return True, "設定を動いた形に戻した"
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def gateway_health():
+    """(状態, 説明) を返す。状態は "ok" / "degraded" / "silent" / "skip"。
+
+    degraded を分けているのは、openclaw 自身がそう名乗るからである。
+    実際に gateway を止めて再開させたとき、
+      Gateway event loop: degraded reasons=event_loop_delay max=11769ms
+    と出て、20秒ほどで max=23ms の ok に戻った。
+    数字は今の窓のもので、詰まりが取れれば自分で戻る。
+    つまり「詰まりかけ」を捕まえられる本物の信号で、
+    答えないより手前の段階として使える。ただし一瞬なら勝手に戻るので、
+    ここで即入れ直すと、治りかけの相手を毎回切ることになる。
+
+    **わざと止めている最中は手を出さない。**更新や復旧の作業中に起こしにいくと、
+    直している側と取り合いになる。2026-09-06、更新の失敗を直している最中に
+    ここが14回数えて gateway を再登録し、書き戻したばかりの設定を消した。
+    印には期限があるので、作業した側が消し忘れても見張りは自分で戻る。
+    """
+    held, why = maintenance()
+    if held:
+        return "skip", why
+
+    if not port_open(GATEWAY_PORT):
+        return "down", "止まっている（まず line-guard の担当）"
+
+    env = dict(os.environ)
+    env["PATH"] = BREW_BIN + ":" + env.get("PATH", "/usr/bin:/bin")
+    try:
+        r = subprocess.run([OPENCLAW, "health"], capture_output=True, text=True,
+                           timeout=HEALTH_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return "silent", f"health が {HEALTH_TIMEOUT} 秒返らない"
+    except OSError as e:
+        return "skip", f"health を呼べない（{e}）"
+
+    if r.returncode != 0:
+        return "silent", f"health が失敗した (exit {r.returncode})"
+    for row in r.stdout.splitlines():
+        if row.startswith("Gateway event loop"):
+            detail = row.strip()
+            return ("degraded" if "degraded" in detail else "ok"), detail
+    return "silent", "health に gateway の行が出ない"
+
+
+
+
+
+def look(name, stale):
+    """その見張りの心拍を見て (困っているか, 言い方) を返す。
+
+    **「心拍が無い」を困っていない側に入れないこと。**
+    ここは見張りごとに同じ if を書き分けていて、model-guard だけが
+    `age is None` を異常として扱い、line-guard / qwc-guard / 訓練 の3つは
+    `age is not None and ...` だった。つまり**心拍ファイルが消えるか壊れると、
+    その3つは永久に無視される**。表示だけ「まだ心拍が無い」と出て、誰も動かない。
+    心拍は上書きで書いていたので、書いている最中に電源が落ちれば壊れうる
+    （書き方のほうも guardlib で直した）。
+
+    **寝ている間は誰も心拍を打てない。** 起きた直後に「30分止まっている」と
+    読めるのは当たり前で、相手が死んだ証拠ではない。2026-08-31 の蹴り合いは
+    ここを見ていなかったせいで始まった。"""
+    age = pulse_age(name)
+    if age is not None and age <= stale:
+        unit = "秒" if age < 90 else "分"
+        return False, (f"{int(age)}秒前に走った" if age < 90
+                       else f"{int(age // 60)}分前に走った")
+    # **stale をそのまま渡さないこと。** qwc-guard は30時間、訓練は3日を
+    # しきい値にしているので、それを猶予にすると起床後その間ずっと
+    # 判断しないことになる（寝るたびに点検が丸ごと止まる）。
+    if settling():
+        return False, "寝起きなので、まだ判断しない"
+    if age is None:
+        return True, "心拍が無い（一度も走っていないか、心拍が壊れている）"
+    if age >= 86400:
+        return True, f"{int(age // 86400)}日走っていない"
+    if age >= 5400:
+        return True, f"{int(age // 3600)}時間止まっている"
+    return True, f"{int(age // 60)}分止まっている"
+
+
+def wake(name, label, stale, state, told_key, why_it_matters, dry, troubles):
+    """黙っていれば蹴る。**何が起きたかをそのまま書く。**
+
+    前はここが `蹴った（成功）` としか書かなかった。kickstart が
+    「走っている最中なので手を出さない」「さっき蹴ったばかり」を返しても
+    区別が付かず、50回「成功」と書きながら一度も直っていない、が起きた。"""
+    bad, how = look(name, stale)
+    if not bad:
+        state.pop(told_key, None)
+        return how
+    troubles.append(f"{name} が{how}")
+    if dry:
+        return how
+    did, why = kickstart(label)
+    G.log(f"{name} が{how} → {why}")
+    if did == "kicked":
+        G.tell_once(state, told_key,
+                    f"見張り（{name}）が{how}ので蹴り直しました。\n{why_it_matters}")
+    elif did == "failed":
+        G.tell_once(state, told_key,
+                    f"見張り（{name}）が{how}のに、起こせませんでした（{why}）。"
+                    f"\n{why_it_matters}"
+                    f"\n  launchctl print gui/$(id -u)/{label}")
+    return f"{how}（{why}）"
+
+
+def 点呼する(state, 書いてよい, troubles):
+    """家じゅうを1回読んで、**今まで誰も見ていなかった壊れ方だけ**引き取る。
+
+    読めなければ黙らない。点呼が死ぬことと、家が無事なことは別で、
+    取り違えると「静かだから大丈夫」に化ける。"""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import silence
+    except Exception as e:
+        troubles.append(f"点呼が読めない（{type(e).__name__}）")
+        return f"読めない: {e}"
+    # **maintenance() は (そうか, 説明) のタプル。**`if maintenance():` は
+    # 中身に関係なく必ず真になる（2026-09-12、書いた直後に踏んだ）。
+    # 黙らせない仕組みが、自分で永久に黙るところだった。
+    手入れ中, なぜ = maintenance()
+    if 手入れ中:
+        return f"手入れ中なので見送り（{なぜ}）"
+    try:
+        # **自分の行は、1つ前の走りと比べてもらう。**点呼をしているのは自分なので、
+        # そのままだと自分だけが永久に「走っている最中」で据え置かれる（2026-09-23）。
+        所見, 新 = silence.点呼(自分="ai.openclaw.watchdog")
+    except Exception as e:
+        troubles.append(f"点呼が走らない（{type(e).__name__}）")
+        return f"走らない: {e}"
+    # **調べるだけのとき（--report / --check / --dry-run）は書かない。**
+    # ここで覚えを書くと、呼んだ人が「起きていた時計」を進めてしまい、
+    # 次の本番の点呼が遅れを取り違える。
+    if 書いてよい:
+        silence.書く覚え(新)
+
+    鳴 = []
+    for s_ in 所見:
+        if s_["判定"] not in silence.鳴る判定:
+            continue
+        # **外の証人が無いことは、ここでは鳴らさない。**毎分の警報にすると
+        # 読まれなくなる。消し方は1つ（実際に外に置く）で、それは手の仕事。
+        if s_["鍵"] == "外の証人":
+            continue
+        # **訓練が使う使い捨ての仕事は鳴らさない。**
+        # guard-drill は本物の launchd に silence-probe を登録して外す。
+        # 台帳は登録した瞬間に載るので（それが台帳の値打ちなので）、
+        # 毎分の点呼がその途中を見ると、訓練のたびに警報が出る。
+        # **台帳から隠すのではなく、警報の側で名指しして見送る**
+        # ——隠すと、証明が「台帳に載る」を確かめられなくなる。
+        if s_["名前"] == "silence-probe":
+            continue
+        if s_["名前"] in 点呼の担当外 and s_["判定"] in (silence.黙, silence.落):
+            continue          # ここは wake() と gateway_health() の持ち場
+        鳴.append(s_)
+
+    # **知らせるのは中身が変わったときだけ。**同じ顔ぶれが続く日は黙る。
+    # ただし state には毎回残すので、`--report` では今の姿がいつでも読める。
+    印 = "｜".join(f"{x['名前']}={x['判定']}" for x in sorted(鳴, key=lambda x: x["名前"]))
+    前印 = state.get("rc_told", "")
+    state["rc_now"] = 印
+    if 印 != 前印 and 書いてよい:
+        state["rc_told"] = 印
+        if 鳴:
+            本文 = "\n".join(f"  ・{x['名前']}: {x['判定']} — {x['説明']}" for x in 鳴[:8])
+            G.log(f"点呼: {印}")
+            G.notify(f"点呼で {len(鳴)} 本ひっかかりました。\n{本文}"
+                     + ("\n  …ほか" if len(鳴) > 8 else "")
+                     + "\n見るには: silence.py")
+        elif 前印:
+            G.log("点呼: 全部戻った")
+            G.notify("点呼でひっかかっていたものが、全部戻りました。")
+    if 鳴:
+        troubles.append(f"点呼 {len(鳴)} 本")
+    return (f"{len(所見)} 本を点呼・{len(鳴)} 本ひっかかり（" + 印 + "）") if 鳴 \
+        else f"{len(所見)} 本を点呼・全部そろっている"
+
+
+def main():
+    args = set(sys.argv[1:])
+    dry = "--dry-run" in args
+    調べるだけでない = not dry and "--report" not in args and "--check" not in args
+
+    # 調べるだけのときは、走っている相手の邪魔をしないので鍵は要らない。
+    if 調べるだけでない:
+        if not G.hold_lock():
+            return 0
+    # gateway のログはこの見張りの持ち場。誰も回していないので20MBまで育っていた。
+    trim_file(GATEWAY_LOG)
+
+    state = G.load_state()
+    now = datetime.now()
+    troubles = []
+
+    # 1〜4. 見張りたちが走り続けているか
+    #
+    # 4つとも同じ見方（look / wake）に寄せた。前は4箇所に書き分けてあって、
+    # うち3つが「心拍が無い」を見逃していた。判断そのものは各見張りが持つが、
+    # **同じことを4回書くと、そのうち3回がずれる**というのがこの家の実績。
+    mg = wake("model-guard", MODEL_GUARD_LABEL, MODEL_GUARD_STALE, state, "mg_told",
+              "これが黙っているあいだ、ローカルのモデルは誰も見ていません。",
+              dry, troubles)
+    lg = wake("line-guard", LINE_GUARD_LABEL, LINE_GUARD_STALE, state, "lg_told",
+              "これが黙っているあいだ、LINEの入り口は誰も見ていません。",
+              dry, troubles)
+    # qwc-guard はここだけ蹴っても直らない（qwc は常駐していないので、直す相手がいない）。
+    # それでも見ているのは、「見張りが止まっていた」と「qwc は無事だった」を
+    # 取り違えないため。走っていないなら、無事だと分かっているわけではない。
+    qg = wake("qwc-guard", QWC_GUARD_LABEL, QWC_GUARD_STALE, state, "qg_told",
+              "これが黙っているあいだ、qwc が動くかは誰も確かめていません。",
+              dry, troubles)
+    # 訓練が止まると、**その日から誰も見張りの正しさを確かめていない**ことになる。
+    # 見張りは互いの心拍を見ているので「止まった」は捕まえられる。捕まえられないのは
+    # 「走ってはいるが、もう壊れ方を見分けられなくなっている」ほうで、それを試すのが訓練。
+    gd = wake("guard-drill", GUARD_DRILL_LABEL, GUARD_DRILL_STALE, state, "gd_told",
+              "このあいだ、見張り自身が正しく働くかは誰も確かめていません。",
+              dry, troubles)
+    pg = wake("loop-guard", LOOP_GUARD_LABEL, LOOP_GUARD_STALE, state, "pg_told",
+              "これが黙っているあいだ、空回りしている依頼は誰も見ていません。"
+              "\nほかの見張りは「止まったもの」しか探さないので、"
+              "2分おきに道具を呼び続ける依頼は全員から元気に見えます。",
+              dry, troubles)
+
+    # 5. gateway は立っているのに黙っていないか
+    status, detail = gateway_health()
+    if status in ("ok", "skip"):
+        for k in ("gw_silent", "gw_degraded", "gw_down"):
+            state[k] = 0
+        state.pop("gw_restarted_at", None)
+        state.pop("gw_down_since", None)
+        state.pop("gw_told", None)
+        # 元気なうちに「動いた形」を更新しておく。
+        # 動いていることを確かめられるのは今この瞬間だけで、
+        # 壊れてからでは「どの形なら動いたのか」が分からない。
+        # 毎回やると重いので1日1回。
+        today = now.strftime("%Y-%m-%d")
+        # --check や --report は「調べるだけ」。ここで書き込むと、
+        # 呼んだ相手に副作用が返る。
+        if (status == "ok" and state.get("good_saved") != today
+                and not dry and not args & {"--check", "--report"}):
+            cg = os.path.expanduser("~/bin/config-guard")
+            if os.path.exists(cg):
+                # ここは gateway が元気なときに1日1回通る道。落ちる想定が無いぶん、
+                # 時間切れで例外が上がると平常時に心拍を落とすことになる。
+                try:
+                    subprocess.run([cg, "--save"], capture_output=True, timeout=300)
+                    state["good_saved"] = today
+                except (OSError, subprocess.SubprocessError) as e:
+                    G.log(f"動いた形を控えられなかった（{type(e).__name__}）")
+    else:
+        key = {"silent": "gw_silent", "degraded": "gw_degraded", "down": "gw_down"}[status]
+        limit = {"silent": SILENT_BEFORE_RESTART,
+                 "degraded": DEGRADED_BEFORE_RESTART,
+                 "down": DOWN_BEFORE_RESTART}[status]
+        count = int(state.get(key, 0)) + 1
+        state[key] = count
+        # ひとつが続いているあいだ、ほかは数えない
+        for k in ("gw_silent", "gw_degraded", "gw_down"):
+            if k != key:
+                state[k] = 0
+        troubles.append(f"gateway が{detail}（連続 {count} 回）")
+
+        # 何回目かではなく、何分黙っているかで知らせる。
+        since = state.get("gw_down_since")
+        if not since:
+            since = now.isoformat(timespec="seconds")
+            state["gw_down_since"] = since
+        try:
+            mins = int((now - datetime.fromisoformat(since)).total_seconds()) // 60
+        except ValueError:
+            mins = 0
+        if mins * 60 >= TELL_AFTER and not dry:
+            if G.tell_once(state, "gw_told",
+                           f"gateway が {mins} 分応答していません（{detail}）。"
+                           f"\nまだ直そうとしていますが、時間がかかっています。"):
+                G.log(f"{mins}分 黙っているので途中で知らせた")
+
+        last = state.get("gw_restarted_at")
+        recent = False
+        if last:
+            try:
+                recent = (now - datetime.fromisoformat(last)).total_seconds() < RESTART_COOLDOWN
+            except ValueError:
+                recent = False
+
+        if dry or count < limit:
+            G.log(f"gateway が{status}（{detail}・連続 {count} 回）")
+        elif recent:
+            G.log(f"gateway が{status}（{detail}）だが、入れ直した直後なので待つ")
+        else:
+            state["gw_restarted_at"] = now.isoformat(timespec="seconds")
+            state[key] = 0
+            came_back = restart_gateway()
+            if came_back:
+                G.log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直して戻った")
+                G.notify(f"gateway が {count} 回続けて応答しなかったので入れ直しました。"
+                       f"\n  {detail}"
+                       f"\nこの間の Discord と LINE は届いていないはずです。")
+            else:
+                # 入れ直しても戻らない。次の手は「設定を動いた形に戻す」。
+                # 原因の多くは設定で、決めてある形に戻すのが結果の読める手当てになる。
+                G.log(f"gateway が{status}のまま {count} 回（{detail}） → 入れ直しでは戻らなかった")
+                rolled, how = rollback_config()
+                if rolled:
+                    G.log("設定を動いた形に戻して復旧した")
+                    G.notify("gateway が入れ直しても戻らなかったので、設定を動いた形に戻しました。"
+                             f"\n  {detail}"
+                             "\n戻す前の設定は残してあります: config-guard --log")
+                else:
+                    G.log(f"設定を戻しても復旧できなかった（{how}）")
+                    G.notify(f"gateway が入れ直しても設定を戻しても戻りません（{how}）。"
+                             f"\n  {detail}"
+                             "\n手で見てください: claw status / config-guard --log")
+
+    # 6. 点呼。**台帳は launchd と gateway から生やす。**
+    rollcall = 点呼する(state, 調べるだけでない, troubles)
+
+    G.save_state(state)
+    G.beat()
+
+    if "--check" in args:
+        print("NG " + " / ".join(troubles) if troubles else "OK")
+    elif "--report" in args:
+        print(f"model-guard : {mg}")
+        print(f"line-guard  : {lg}")
+        print(f"qwc-guard   : {qg}")
+        print(f"loop-guard  : {pg}")
+        print(f"訓練        : {gd}")
+        print(f"gateway     : {detail}")
+        print(f"点呼        : {rollcall}")
+        wd = pulse_age("watchdog")
+        print(f"watchdog    : いま走った（前回は {int(wd)} 秒前）" if wd is not None else "watchdog    : 初回")
+    elif dry and troubles:
+        print("[dry-run] " + " / ".join(troubles))
+
+    return 1 if troubles else 0
+
+
+if __name__ == "__main__":
+    # 落ちても心拍だけは残す。生きているのに心拍が無いと、model-guard はそれを
+    # 「死んだ」と読んで蹴りにくる。2026-08-31 の蹴り合いはそこから始まった。
+    sys.exit(G.run(main))

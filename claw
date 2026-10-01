@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""
+claw — OpenClaw をターミナルから立ち上げる。
+
+    claw            立ち上げる（もう動いていれば何もしない）
+    claw status     今どうなっているか見る
+    claw stop       止める
+    claw restart    止めてから立ち上げ直す
+    claw log        ログを流し見る（Ctrl-C で抜ける）
+    claw chat       ターミナルでそのまま話す
+    claw ui         ブラウザの管理画面を開く
+    claw fix        LINE の入り口を点検して直す
+    claw update     OpenClaw を更新する（壊れたときの復旧もこれ）
+    claw hold 30m   見張りに手を出させない（手作業の前に置く。期限つき）
+    claw hold       いま印があるか・誰が守るかを見る
+    claw hold --off 印を外す
+    claw down       家をまるごと止める（見張り9本・本体・LINE・頭脳17GB）
+    claw up         claw down で止めた形に、そのまま戻す
+
+`claw down` は**止める前に、走っている仕事の終わりを待つ**（殺さない）。
+止めた形は控えておくので、`claw up` は「たぶんこれが動いていたはず」ではなく
+控えのとおりに戻す。道具を増やしても、控えのほうが勝手に追いつく。
+
+待ちきれなかったときは**止めずに帰る**。その枝を手で試すには:
+
+    qwc-async "READMEの1行目を教えて。何も書き換えないで。" qwc
+    CLAW_WORK_WAIT=2 claw down     # → 止めずに帰り、終了コード1
+
+訓練（guard-drill）には入れていない。試すたびに本物の qwc を1回走らせることになり、
+毎朝モデル時間を使って Discord と LINE に結果が飛ぶ。**この枝は壊れても人の目の前で
+壊れる**（人が打つコマンドなので）ので、黙って壊れる見張りとは事情が違う。
+
+手で何かをいじる前に `claw hold 30m` を置くこと。置かないと、見張りが
+「落ちている」と読んで直しにきて、直している側と取り合いになる。
+2026-09-06、更新の40分間に line-guard が gateway を3回起こし直し、
+生きたトンネルを6回張り替えて URL を6回変えた。
+
+**管理画面の更新ボタンは押さないこと。** 押すと本体だけ上がって
+Discord と LINE の部品が取り残され、起動しなくなる。順番を守る必要があるので
+`claw update` を通すこと。中身は openclaw-update にある。
+
+立ち上げるもの:
+  ollama       … 頭脳。設定で選んだモデルを動かす。落ちていれば起こす
+  gateway      … 本体。Discord と LINE の受け口はここが持っている
+  LINE の3つ   … トンネル / 受け口 / URL同期。落ちていれば起こす
+
+gateway は launchd 登録済みなので、本来はログインすると勝手に上がる。
+このコマンドは「上がっていないとき」と「上がったか確かめたいとき」用。
+"""
+
+import json
+import os
+import plistlib
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import (MAINT_MARK, MAINT_MAX, atomic_write,  # noqa: E402
+                      honors_mark, maintenance, maintenance_clear,
+                      maintenance_hold, 道具の呼び方)
+
+BIN = os.path.dirname(os.path.abspath(__file__))
+AGENTS = os.path.expanduser("~/Library/LaunchAgents")
+
+GATEWAY_PORT = 18789
+OLLAMA_URL = "http://127.0.0.1:11434/api/tags"
+GATEWAY_LOG = os.path.expanduser("~/Library/Logs/openclaw/gateway.log")
+CONFIG = os.path.expanduser("~/.openclaw/openclaw.json")
+TUNNEL_LOG = os.path.expanduser("~/.openclaw/logs/cloudflared-line.log")
+LAUNCH_AGENTS = os.path.expanduser("~/Library/LaunchAgents")
+
+# LINE を外から使うための常駐。gateway とは別プロセスで動いている。
+LINE_SERVICES = [
+    ("ai.openclaw.line-tunnel", "トンネル"),
+    ("ai.openclaw.line-proxy", "受け口"),
+    ("ai.openclaw.line-sync", "URL同期"),
+]
+
+# 見張りたち。名前・表示名・心拍がこれより古ければ黙っているとみなす秒数。
+# それぞれ2分・3分・5分おきに走るので、3回ぶん見送っても余裕がある長さにしてある。
+GUARDS = [
+    ("model-guard", "頭脳（ollama）", 400),
+    ("watchdog", "本体と見張り", 700),
+    ("line-guard", "LINEの入り口", 1100),
+    # qwc は常駐しないので1日1回でよい。丸1日以上あいたら止まっているとみなす。
+    ("qwc-guard", "コードを書く側", 30 * 3600),
+    # 見張り自身が正しく働くかを試す訓練（毎日05:30）。ここが止まると、
+    # 見張りは走っているのに「正しく見張れているか」は誰も確かめていない状態になる。
+    ("guard-drill", "訓練（毎日）", 3 * 24 * 3600),
+]
+PULSE_DIR = os.path.expanduser("~/.openclaw/pulse")
+
+OK = "\033[32m●\033[0m"
+NG = "\033[31m●\033[0m"
+
+
+def say(mark, label, detail=""):
+    print(f"  {mark} {label}" + (f"  {detail}" if detail else ""))
+
+
+def ago(sec):
+    """経過時間を、その長さに合った単位で。
+
+    1分おきのものと1日1回のものが同じ表に並ぶので、秒で通すと
+    「43200秒前」のような読めない数字が混ざる。"""
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec}秒"
+    if sec < 5400:
+        return f"{sec // 60}分"
+    if sec < 172800:
+        return f"{sec // 3600}時間"
+    return f"{sec // 86400}日"
+
+
+def pulse_age(name):
+    """見張りが最後に走り切ってから何秒たったか。一度も走っていなければ None。
+
+    ここは心拍を読むだけで、点検そのものはしない。
+    claw status は毎日打つものなので、ollama に問い合わせて数秒待たせない。
+    実際に確かめたいときは model-guard --report / watchdog --report を使う。"""
+    try:
+        with open(os.path.join(PULSE_DIR, f"{name}.json")) as f:
+            at = datetime.fromisoformat(json.load(f)["at"])
+        return (datetime.now() - at).total_seconds()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def run(args, quiet=True):
+    """コマンドを実行して (成功したか, 出力) を返す。
+
+    **家の道具は、その OS での呼び方に並べ直してから渡す**
+    （Windows は拡張子の無いファイルを直に実行できない）。"""
+    args = 道具の呼び方(args)
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, str(e)
+    out = (p.stdout + p.stderr).strip()
+    if not quiet and out:
+        print(out)
+    return p.returncode == 0, out
+
+
+# ---------------- 状態を見る ----------------
+
+
+def current_model():
+    """設定に書いてある「今使うモデル」を読む。設定を変えても表示がずれないように。"""
+    try:
+        with open(CONFIG) as f:
+            d = json.load(f)
+        name = d["agents"]["defaults"]["model"]["primary"]
+        return name.split("/", 1)[-1]  # "ollama/gemma4:26b" -> "gemma4:26b"
+    except Exception:
+        return "?"
+
+
+def tunnel_url():
+    """cloudflared のログから今のトンネルURLを拾う。"""
+    try:
+        with open(TUNNEL_LOG, errors="ignore") as f:
+            found = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", f.read())
+        return found[-1] if found else None
+    except OSError:
+        return None
+
+
+def tunnel_ok():
+    """LINE の入り口が生きているか。判定は line-guard に任せる。
+
+    自分で curl してはいけない: この回線の DNS は *.trycloudflare.com を
+    引けないので、生きていても必ず「切れている」と出る。
+    line-guard は LINE 本人に webhook を叩いてもらって判定する。
+
+    返り値: (生きているか, 説明)
+    """
+    ok, out = run([os.path.join(BIN, "line-guard"), "--check"])
+    if ok and out.strip() == "OK":
+        return True, ""
+    return False, "LINEから届いていない（claw fix で直す）"
+
+
+def ollama_up():
+    try:
+        with urllib.request.urlopen(OLLAMA_URL, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def gateway_up():
+    """ポートが開いているか。openclaw health より速くて、落ちていても待たされない。"""
+    try:
+        with socket.create_connection(("127.0.0.1", GATEWAY_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _止め方():
+    """その機械での止め方を、実物の仕組みに合わせて言う。"""
+    import schedlib
+    s = schedlib.仕組み()
+    if s == "launchd":
+        return ("launchctl bootout gui/$(id -u)/ai.openclaw.<名前>"
+                "（claw down なら全部まとめて）")
+    if s == "systemd":
+        return "systemctl --user stop ai.openclaw.<名前>（claw down なら全部まとめて）"
+    return "この機械には常駐・定時の仕組みが無い（claw down は使えない）"
+
+
+def launchd_pids():
+    """登録されている仕事を { ラベル: PID または None } にする。
+
+    **仕組み（launchd / systemd / 無し）は schedlib が知っている。**
+    ここは名前で絞らない（ollama のように別の名前で登録されているものも見る）。"""
+    import schedlib
+    return schedlib.PID一覧(接頭=None)
+
+
+def wait_for(check, seconds, note):
+    """check() が True になるまで待つ。待っている間は点を打つ。"""
+    for i in range(seconds):
+        if check():
+            if i:
+                print()
+            return True
+        if i == 0:
+            print(f"  … {note}", end="", flush=True)
+        print(".", end="", flush=True)
+        time.sleep(1)
+    print()
+    return False
+
+
+# ---------------- 起こす ----------------
+
+
+def start_ollama():
+    if ollama_up():
+        return True
+    print("  … ollama を起こす")
+    run(["brew", "services", "start", "ollama"])
+    return wait_for(ollama_up, 30, "ollama の返事を待つ")
+
+
+def start_gateway():
+    if gateway_up():
+        return True
+    ok, out = run(["openclaw", "daemon", "start"])
+    if not ok:
+        print("  ! gateway を起こせなかった")
+        if out:
+            print("    " + out.replace("\n", "\n    "))
+        return False
+    return wait_for(gateway_up, 60, "gateway の起動を待つ")
+
+
+def start_line():
+    """LINE の常駐を、落ちているものだけ起こす。"""
+    pids = launchd_pids()
+    for label, name in LINE_SERVICES:
+        if pids.get(label):
+            continue
+        plist = os.path.join(LAUNCH_AGENTS, f"{label}.plist")
+        if not os.path.exists(plist):
+            continue
+        if label in pids:
+            schedlib.蹴る(label, 殺す=True, path=plist)
+        else:
+            schedlib.入れる(label, plist)
+        print(f"  … LINE の{name}を起こした")
+
+
+def repair_tunnel():
+    """LINE の入り口が切れていれば直す。中身は line-guard に任せる。"""
+    reachable, _ = tunnel_ok()
+    if reachable:
+        return
+    print("  … LINE の入り口が切れているので直す（1〜2分かかる）")
+    subprocess.run(道具の呼び方([os.path.join(BIN, "line-guard"), "--report"]))
+
+
+def self_running():
+    """時計で勝手に走るもの。(名前, 実行ファイル) を返す。
+
+    **一覧を手で書かない。**書いた一覧は、道具を1つ増やした日から嘘になる。
+    launchd の登録そのものを見れば、増えても減っても勝手に追いつく。
+    常駐（KeepAlive だけのもの）は時計で走らないので、ここには出さない。"""
+    out = []
+    try:
+        names = sorted(os.listdir(AGENTS))
+    except OSError:
+        return out
+    for fn in names:
+        if not (fn.startswith("ai.openclaw.") and fn.endswith(".plist")):
+            continue
+        try:
+            with open(os.path.join(AGENTS, fn), "rb") as f:
+                p = plistlib.load(f)
+        except Exception:
+            continue
+        if not (p.get("StartInterval") or p.get("StartCalendarInterval")):
+            continue
+        args = p.get("ProgramArguments") or []
+        if not args:
+            continue
+        exe = os.path.expanduser(args[0])
+        if os.path.dirname(exe) == BIN and os.path.isfile(exe):
+            out.append((os.path.basename(exe), exe))
+    return out
+
+
+def show_hold():
+    """いま印があるか、そして誰がそれを守るか。
+
+    **守る側の一覧も実物から作る。**「足したはず」と実物がずれるのが
+    この一式の壊れ方なので、ファイルを読んで確かめたものだけを ● にする。"""
+    held, why = maintenance()
+    print(f"  ● {why}" if held else "  ○ 印はありません（見張りはふつうに働きます）")
+    if held:
+        # 何がこの印を切るのか。**期限だけなのか、置き主の命もなのか。**
+        # 置き主が死んでも切れない印は、死んだ分だけ見張りが黙り続ける。
+        try:
+            with open(MAINT_MARK) as f:
+                m = json.load(f)
+        except (OSError, ValueError):
+            m = {}
+        if m.get("tied"):
+            print(f"     置き主（PID {m.get('pid', '?')}）が消えたら、期限を待たずに切れます")
+        else:
+            print("     期限が来るまで切れません（人が置いた印なので）")
+    print()
+    print("  時計で勝手に走るもの:")
+    deaf = []
+    for name, exe in self_running():
+        if honors_mark(exe):
+            print(f"    ● {name:<14} 印を見る")
+        else:
+            print(f"    ✗ {name:<14} 印を見ない")
+            deaf.append(name)
+    if deaf:
+        print()
+        print(f"  ✗ の {len(deaf)} 個は、印を置いても手を出してきます。")
+        print("     手入れの前に止めるなら: " + _止め方())
+    return 0
+
+
+def parse_span(text):
+    """「30m」「90s」「1h」「30」を秒にする。単位が無ければ分。読めなければ None。"""
+    m = re.fullmatch(r"(\d+)\s*(s|m|h|秒|分|時間|時)?", text.strip())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    if unit in ("s", "秒"):
+        return n
+    if unit in ("h", "時間", "時"):
+        return n * 3600
+    return n * 60
+
+
+# **claw の窓口ではない単体の道具。**`claw <名前>` でも通す。
+#
+# 2026-09-12 に実測して分かったこと。心拍のモデルは 09-11 までは
+# `house-brief` と打っていたのに、09-12 からは `claw house-brief` に変えた。
+# こちらは「知らないコマンド」で終了コード 1 を返すだけなので、
+# **house-brief は32時間1度も走らなかった。**誰も気づかなかったのは、
+# そのとき house-brief に期限が無く、点呼から見えなかったため。
+#
+# 直し方は2つある。モデルに正しい綴りを覚えさせるか、**打ちそうな綴りを
+# 通すか。**この家は後者を選んできた（gemma4 が37文字の識別子を26回中23回
+# 写し損ねたので `notify` を作った、あれと同じ判断）。
+# **文章の忠告は効かず、通る道を作るほうが効く。**
+通す道具 = {
+    "house-brief": "house-brief",     # 隙間を見て回る報せ（心拍が読む）
+    "brief": "house-brief",
+    "guardrun-sweep": "guardrun-sweep",   # 黙って終わった走りの掃除
+    "sweep": "guardrun-sweep",
+}
+
+
+def cmd_通す(名):
+    """~/bin の単体の道具を、そのまま走らせて終了コードを返す。
+
+    **引数もそのまま渡す。**途中で削ると、`--all` や `--report` が
+    黙って落ちて、呼んだ側には成功に見える。"""
+    道具 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 通す道具[名])
+    if not os.path.exists(道具):
+        print(f"  {通す道具[名]} が見つかりません: {道具}")
+        return 1
+    return subprocess.run([道具] + sys.argv[2:]).returncode
+
+
+def cmd_hold():
+    """手入れ中の印を置く・見る・外す。
+
+    印には必ず期限がある。置いた人が消し忘れても、期限が来れば
+    見張りは自分から戻る。**期限の無い停止を作らないこと**——
+    それは「見張りを消した」のと同じで、消したことに誰も気づけない。"""
+    args = [a for a in sys.argv[2:] if a.strip()]
+
+    if not args:
+        return show_hold()
+
+    if args[0] in ("--off", "off", "解除"):
+        held, why = maintenance()
+        maintenance_clear()
+        print(f"  ● 印を外しました（{why}）" if held else "  ○ もともと印はありません")
+        return 0
+
+    seconds = parse_span(args[0])
+    if seconds is None:
+        print(f"  時間の読み方が分かりません: {args[0]}")
+        print("  例: claw hold 30m / claw hold 90s / claw hold 1h / claw hold 30")
+        return 1
+    why = " ".join(args[1:]).strip() or "手作業"
+
+    capped = min(seconds, MAINT_MAX)
+    if not maintenance_hold(why, seconds, "claw hold"):
+        print("  ✗ 印を置けませんでした（書き込めない）")
+        return 1
+    print(f"  ● 印を置きました  {capped // 60}分（{why}）")
+    if capped < seconds:
+        print(f"     {seconds // 60}分と言われましたが、上限の {MAINT_MAX // 60}分にしました。")
+        print("     期限の無い停止を作らないための上限です。")
+    print()
+    return show_hold()
+
+
+# ── 家ごと止める・戻す ────────────────────────────────
+#
+# **一元管理のための口。**止めるものが14個あり、順番にも意味がある
+# （見張りを先に外さないと、止めたそばから起こしにくる）。
+# それを覚えておくのは人の仕事ではない。
+DOWN_MARK = os.path.expanduser("~/.openclaw/house-down.json")
+
+# 人が頼んだ仕事。止める前に、これらの終わりを待つ。
+WORK_COMMANDS = ["qwc", "qwc-async", "research-async",
+                 "morning-brief", "sns-draft", "watch-pages", "casual-ping"]
+# qwc-async 自身の上限が30分なので、それより少し長く待つ。
+#
+# **環境変数で短くできるようにしてある。**「待ちきれなかったら止めずに帰る」枝は、
+# 素のままでは35分待たないと一度も通らない。通らない枝は、いざというときに
+# 「発火しませんでした」になる。訓練でここを叩けるようにしておく。
+WORK_WAIT_MAX = int(os.environ.get("CLAW_WORK_WAIT") or 35 * 60)
+
+
+def running_cron():
+    """いま走っている定時の仕事。(名前, 経過) の一覧。
+
+    **プロセスでは見えない。**定時の仕事は gateway の中で走るので、
+    `ps` に qwc のような独立したプロセスとしては現れない。記録のほうを見る。
+
+    2026-09-08、`claw down` が qwc は待つのに定時は待たず、実行中だった
+    心拍を切った（記録に `interrupted` が残っている）。"""
+    try:
+        con = sqlite3.connect(
+            f"file:{os.path.expanduser('~/.openclaw/state/openclaw.sqlite')}?mode=ro",
+            uri=True, timeout=5)
+        rows = con.execute(
+            "select coalesce(j.name, r.job_id), r.started_at_ms"
+            "  from cron_run_receipts r left join cron_jobs j on j.job_id = r.job_id"
+            " where r.status = 'running'").fetchall()
+        con.close()
+    except Exception:
+        return []
+    now = time.time() * 1000
+    return [(n, ago((now - t) / 1000)) for n, t in rows]
+
+
+def running_work():
+    """いま走っている「頼まれ仕事」。(PID, 名前, 経過) の一覧。
+
+    **実行ファイルの絶対パスが引数に立っているときだけ数える。**
+    `ps` の出力には、その名前に言及しているだけの別のコマンド
+    （このコマンド自身を含む）が混ざるので、部分一致で数えると必ず誤る。"""
+    ok, out = run(["ps", "-Ao", "pid=,etime=,command="])
+    if not ok:
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, etime, cmd = parts
+        words = cmd.split()
+        for name in WORK_COMMANDS:
+            if os.path.join(BIN, name) in words:
+                found.append((pid, name, etime))
+                break
+    return found
+
+
+def loaded_labels():
+    """いま launchd に登録されている、この家のラベル。"""
+    return [lb for lb in launchd_pids() if lb.startswith("ai.openclaw.")]
+
+
+GATEWAY_LABEL = "ai.openclaw.gateway"
+
+
+def bootout(label, name):
+    """登録から外して、**消えたことを実物で確かめる**。
+
+    `launchctl bootout` はすぐには返らない。外した直後に一覧を引くと
+    まだ載っていることがあり、そこで「失敗」と書くと嘘になる
+    （2026-09-08、LINE のトンネルを実際に外せていたのに失敗と報告した）。
+
+    ラベルは**実行ファイル名から組み立てない**。`ai-backup` の登録名は
+    `ai.openclaw.backup` で、名前がずれている。組み立てた名前で外すと
+    存在しないものを外して、存在しないことを確かめて、緑を出す——
+    外れていないのに成功と報告する、いちばん危ない形になる。"""
+    import schedlib
+    schedlib.外す(label)
+    for _ in range(15):
+        if label not in launchd_pids():
+            say(OK, name)
+            return True
+        time.sleep(1)
+    say(NG, name, "外れなかった")
+    return False
+
+
+def cmd_down():
+    """家をまるごと止める。戻すのは claw up。"""
+    if os.path.exists(DOWN_MARK):
+        print("  もう止まっています。戻すなら claw up")
+        return 0
+
+    # 1. 走っている仕事の終わりを待つ。**殺さない。**
+    #    頼まれ仕事（qwc など・プロセスで見える）と、
+    #    定時の仕事（gateway の中で走る・記録でしか見えない）の両方。
+    def busy():
+        return ([f"{n}（{e} 経過・PID {p}）" for p, n, e in running_work()]
+                + [f"{n}（{e} 経過・定時）" for n, e in running_cron()])
+
+    work = busy()
+    if work:
+        print("  いま動いている仕事があります。終わるまで待ちます。")
+        for line in work:
+            print(f"    {line}")
+        # 1秒刻みで見る。5秒刻みだと、終わった仕事を最大5秒待ち続けるうえ、
+        # **短い上限で試せない**（上限を1秒にしても1回は5秒眠ってしまう）。
+        # 試せない枝は、いざというときに「発火しませんでした」になる。
+        waited = 0
+        while waited < WORK_WAIT_MAX:
+            time.sleep(1)
+            waited += 1
+            work = busy()
+            if not work:
+                break
+            if waited % 30 == 0:
+                print(f"    … {waited // 60}分{waited % 60}秒 待っています（{work[0]}）")
+        if work:
+            # 長さは ago() に任せる。分で割ると、短い上限で試したときに
+            # 「0分待っても」と出て、訓練の出力が読めなくなる。
+            print(f"  ! {ago(WORK_WAIT_MAX)}待っても終わりませんでした。**止めずに帰ります。**")
+            print("    先にその仕事を終わらせてから、もう一度。")
+            return 1
+        print("  ● 仕事が終わりました")
+
+    # 2. いまの形を控える。**戻すときはこの控えだけを見る。**
+    #    「たぶんこれが動いていたはず」で戻すと、増やした道具が戻らない。
+    state = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "labels": loaded_labels(),
+        "ollama": ollama_up(),
+        "model": resident_model_note(),
+        "ollama_env": ollama_env(),
+    }
+    if not atomic_write(DOWN_MARK, json.dumps(state, ensure_ascii=False, indent=2)):
+        print("  ✗ 控えを書けませんでした。止めません（戻せなくなるため）")
+        return 1
+    print(f"  ● いまの形を控えました  登録 {len(state['labels'])} 件"
+          + (f"・頭脳 {state['model']}" if state["model"] else ""))
+
+    # 3. 見張りに手を出させない。**外す前に置く。**
+    #    外し終わる前に見張りが走ると、止めたそばから起こしにくる。
+    maintenance_hold("claw down で家を止めている", MAINT_MAX, "claw down")
+
+    # 4. 何を外すかは**実物の登録から決める**。手で書いた一覧は、
+    #    道具を1つ増やした日から嘘になる。
+    line_labels = {lb for lb, _ in LINE_SERVICES}
+    scheduled = [lb for lb in state["labels"]
+                 if lb != GATEWAY_LABEL and lb not in line_labels]
+
+    print("\n  見張りと定時のものを外す")
+    for label in sorted(scheduled):
+        bootout(label, label.replace("ai.openclaw.", ""))
+
+    # 5. gateway → LINE → ollama。依存の下流から止める。
+    #    **`openclaw daemon stop` では止まらない。**plist は落ちたら起こす設定なので、
+    #    プロセスを止めても launchd がすぐ起こし直す。登録から外すのが正しい
+    #    （2026-09-08、daemon stop で「止まらない」と出たのはこれが理由）。
+    print("\n  本体と入り口を止める")
+    bootout(GATEWAY_LABEL, "gateway")
+    for _ in range(15):
+        if not gateway_up():
+            break
+        time.sleep(1)
+    if gateway_up():
+        say(NG, "gateway", "登録は外れたが、ポートがまだ開いている")
+
+    for label, nm in LINE_SERVICES:
+        if label in state["labels"]:
+            bootout(label, f"LINE の{nm}")
+
+    print("\n  頭脳を降ろす")
+    run(["brew", "services", "stop", "ollama"])
+    for _ in range(30):
+        if not ollama_up():
+            break
+        time.sleep(1)
+    say(NG if ollama_up() else OK, "ollama",
+        "止まらない" if ollama_up() else "止まった（17GB 空いた）")
+
+    print()
+    print("  家を止めました。戻すには:  claw up")
+    return 0
+
+
+def cmd_up():
+    """claw down で止めた形に戻す。"""
+    try:
+        with open(DOWN_MARK) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        print("  止めた記録がありません。ふつうに立ち上げるなら claw")
+        return 1
+
+    print(f"  {state.get('at', '?')} に止めた形へ戻します\n")
+
+    # 止めたときと逆順。上流（頭脳）から。
+    print("  頭脳を載せる")
+    # **戻すのは起こしたあと。**`brew services stop` は plist ごと消すので、
+    # 止まっている間は書き戻す先が無い。`brew services start` が作り直してから、
+    # そこへ書き足して、定義を読み直させる（2026-09-08 に順番を間違えた）。
+    if not start_ollama():
+        print("  ✗ ollama が上がりませんでした。ここで止めます（頭脳が無いと意味がない）")
+        return 1
+    say(OK, "ollama")
+
+    # brew が作り直した plist に、手で足してあった設定を書き戻す。
+    if restore_ollama_env(state.get("ollama_env")):
+        schedlib.外す("homebrew.mxcl.ollama")
+        time.sleep(2)
+        schedlib.入れる("homebrew.mxcl.ollama", OLLAMA_PLIST)
+        wait_for(ollama_up, 30, "ollama の載せ直しを待つ")
+
+    # 届いたかを**プロセスの環境で**確かめる。plist に書いてあることは、
+    # そのプロセスに渡っていることを意味しない（kickstart だと読み直さない）。
+    want = state.get("ollama_env") or {}
+    if want:
+        ok_env, out = run(["bash", "-c",
+                           "ps eww $(pgrep -f '[o]llama serve' | head -1)"])
+        lost = [k for k, v in want.items() if f"{k}={v}" not in out]
+        if lost:
+            say(NG, "ollama に届いていない設定", " / ".join(lost))
+            print("     手で: launchctl bootout gui/$(id -u)/homebrew.mxcl.ollama")
+            print("           launchctl bootstrap gui/$(id -u) " + OLLAMA_PLIST)
+        else:
+            say(OK, "ollama の設定", " / ".join(f"{k}={v}" for k, v in want.items()))
+
+    print("\n  本体と入り口を起こす")
+    if not start_gateway():
+        print("  ✗ gateway が上がりませんでした。claw log でログを見てください")
+        return 1
+    say(OK, "gateway", f"ポート {GATEWAY_PORT}")
+    start_line()
+
+    # 見張りは**最後**。起動中に走らせると、立ち上がりかけを障害と読む。
+    print("\n  見張りと定時のものを戻す")
+    now = launchd_pids()
+    for label in state.get("labels", []):
+        if label in now:
+            continue
+        plist = os.path.join(LAUNCH_AGENTS, f"{label}.plist")
+        if not os.path.exists(plist):
+            say(NG, label.replace("ai.openclaw.", ""), "plist が無い")
+            continue
+        schedlib.入れる(label, plist)
+        back = label in launchd_pids()
+        say(OK if back else NG, label.replace("ai.openclaw.", ""),
+            "" if back else "戻せなかった")
+
+    # 控えを消すのは**全部戻したあと**。途中で落ちたら、控えは残しておく。
+    maintenance_clear()
+    try:
+        os.unlink(DOWN_MARK)
+    except OSError:
+        pass
+
+    repair_tunnel()
+    print()
+    show_status()
+    return 0
+
+
+OLLAMA_PLIST = os.path.expanduser("~/Library/LaunchAgents/homebrew.mxcl.ollama.plist")
+
+
+def ollama_env():
+    """brew の plist に手で足してある環境変数。無ければ空。"""
+    try:
+        with open(OLLAMA_PLIST, "rb") as f:
+            return dict(plistlib.load(f).get("EnvironmentVariables") or {})
+    except Exception:
+        return {}
+
+
+def restore_ollama_env(want):
+    """止める前にあった環境変数を戻す。戻したら True（＝積み直しが要る）。
+
+    **`brew services start` は plist を作り直す。**手で足した
+    `OLLAMA_CONTEXT_LENGTH=65536` はそこで消える。消えたことに気づかないと、
+    広さを指定していない道具が既定値に落ちて、qwc を殺す
+    （2026-08-31 の積み直し合戦がこれ）。2026-09-08、`claw up` が実際にこれを消した。
+
+    **`launchctl kickstart` では戻らない。**あれは登録済みの定義を使うので、
+    plist を書き換えても読み直さない。外して入れ直す必要がある。"""
+    now = ollama_env()
+    missing = {k: v for k, v in (want or {}).items() if now.get(k) != v}
+    if not missing:
+        return False
+    try:
+        with open(OLLAMA_PLIST, "rb") as f:
+            d = plistlib.load(f)
+        d.setdefault("EnvironmentVariables", {}).update(missing)
+        with open(OLLAMA_PLIST, "wb") as f:
+            plistlib.dump(d, f)
+    except Exception as e:
+        say(NG, "ollama の設定を戻せませんでした", str(e)[:80])
+        return False
+    say(OK, "ollama の設定を戻した", " / ".join(f"{k}={v}" for k, v in missing.items()))
+    return True
+
+
+def resident_model_note():
+    """いま載っているモデルと広さ。載っていなければ None。"""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/ps", timeout=3) as r:
+            for m in json.loads(r.read()).get("models", []):
+                return f"{m.get('name')}（{m.get('context_length')}）"
+    except Exception:
+        pass
+    return None
+
+
+def cmd_fix():
+    """LINE まわりを点検して直す。"""
+    return subprocess.run(道具の呼び方([os.path.join(BIN, "line-guard"), "--report"])).returncode
+
+
+def cmd_update():
+    """更新と復旧。中身は openclaw-update に任せる。
+
+    line-guard と同じ扱い。順番を間違えると Discord と LINE が同時に沈むので、
+    ここには手順を書かない（2箇所に書くと、そのうち片方がずれる）。"""
+    args = [a for a in sys.argv[2:] if a.startswith("--")]
+    return subprocess.run([os.path.expanduser("~/bin/openclaw-update"), *args]).returncode
+
+
+# ---------------- 表示 ----------------
+
+
+def health_lines():
+    """openclaw health の頭のほう（Discord / LINE / 応答の速さ）だけ拾う。"""
+    ok, out = run(["openclaw", "health"])
+    if not ok:
+        return []
+    keep = []
+    for line in out.splitlines():
+        if line.startswith(("Discord:", "LINE:", "Gateway event loop:")):
+            keep.append(line.strip())
+    return keep
+
+
+def show_status():
+    # **止まっていることを、まず言う。**これを言わないと、下の「●が全部消えている」
+    # 表を見た人が本物の障害だと読む。止めたのは自分だと分かるようにしておく。
+    try:
+        with open(DOWN_MARK) as f:
+            d = json.load(f)
+        print(f"\n  \033[33m■ この家は claw down で止めてあります"
+              f"（{d.get('at', '?')} から）\033[0m")
+        print("     戻すには: claw up\n")
+    except (OSError, ValueError):
+        pass
+
+    print("OpenClaw の状態")
+
+    say(OK if ollama_up() else NG, f"ollama    頭脳（{current_model()}）")
+
+    up = gateway_up()
+    say(OK if up else NG, f"gateway   本体（127.0.0.1:{GATEWAY_PORT}）")
+
+    pids = launchd_pids()
+    for label, name in LINE_SERVICES:
+        alive = bool(pids.get(label))
+        say(OK if alive else NG, f"LINE      {name}")
+
+    # プロセスが生きていてもトンネルが切れていることがある（実際に10時間気づかなかった）
+    reachable, note = tunnel_ok()
+    say(OK if reachable else NG, "LINE      外からの入り口", note if not reachable else "")
+
+    # 見張りたち。
+    #
+    # ここに出しているのは、3つが別々のプロセスで別々の時計で動いているから。
+    # 1つにまとめると、そのファイルのバグ1つで全部が同時に黙り、
+    # 互いを見張る意味が消える。散らばって見えるのは、そのための代償である。
+    print()
+    for name, label, limit in GUARDS:
+        age = pulse_age(name)
+        if age is None:
+            say(NG, f"見張り    {label}", "動いていない")
+        elif age > limit:
+            say(NG, f"見張り    {label}", ago(age) + "止まっている")
+        else:
+            say(OK, f"見張り    {label}", ago(age) + "前")
+
+    # 設定が「戻せる状態」にあるか。壊したときに戻せないのが一番困る。
+    cg = os.path.expanduser("~/bin/config-guard")
+    if os.path.exists(cg):
+        r = subprocess.run(道具の呼び方([cg]), capture_output=True, text=True)
+        good = "動いた形" in r.stdout and "まだ無い" not in r.stdout
+        changed = "記録していない変更" in r.stdout
+        if not good:
+            say(NG, "設定      戻せる形がまだ無い", "config-guard --save")
+        elif changed:
+            say(OK, "設定      戻せる（未記録の変更あり）", "config-guard --diff")
+        else:
+            say(OK, "設定      戻せる")
+
+    if up:
+        print()
+        for line in health_lines():
+            print(f"    {line}")
+        print(f"\n  管理画面: http://127.0.0.1:{GATEWAY_PORT}/  （claw ui で開く）")
+        print("  話す:     claw chat")
+    else:
+        print("\n  立ち上げる: claw")
+
+
+# ---------------- 各コマンド ----------------
+
+
+def cmd_start():
+    if gateway_up() and ollama_up():
+        print("もう動いている。")
+        print()
+        show_status()
+        return 0
+
+    print("OpenClaw を立ち上げる")
+    if not start_ollama():
+        print("  ! ollama が上がらなかった。頭脳が無いので止まる。")
+        return 1
+    if not start_gateway():
+        print("  ! gateway が上がらなかった。claw log でログを見る。")
+        return 1
+    start_line()
+    repair_tunnel()
+    print()
+    show_status()
+    return 0
+
+
+def cmd_stop():
+    ok, out = run(["openclaw", "daemon", "stop"])
+    print("gateway を止めた。" if ok else f"止められなかった: {out}")
+    print("（ollama と LINE の常駐はそのまま。まるごと止めるなら claw stop --all）")
+    if "--all" in sys.argv:
+        import schedlib
+        for label, name in LINE_SERVICES:
+            schedlib.外す(label)
+            print(f"  LINE の{name}も止めた")
+        run(["brew", "services", "stop", "ollama"])
+        print("  ollama も止めた")
+    return 0 if ok else 1
+
+
+def cmd_restart():
+    run(["openclaw", "daemon", "stop"])
+    time.sleep(2)
+    return cmd_start()
+
+
+def cmd_log():
+    if not os.path.exists(GATEWAY_LOG):
+        print("まだログが無い。")
+        return 1
+    print(f"{GATEWAY_LOG}（Ctrl-C で抜ける）\n")
+    try:
+        subprocess.run(["tail", "-n", "40", "-f", GATEWAY_LOG])
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_chat():
+    if not gateway_up():
+        print("gateway が動いていないので、先に立ち上げる。")
+        if cmd_start() != 0:
+            return 1
+        print()
+    # Discord や LINE と同じ記憶を使う。--local にすると別の頭になるので使わない。
+    return subprocess.run(["openclaw", "tui"]).returncode
+
+
+def cmd_ui():
+    if not gateway_up():
+        print("gateway が動いていないので、先に立ち上げる。")
+        if cmd_start() != 0:
+            return 1
+    return subprocess.run(["openclaw", "dashboard"]).returncode
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
+    table = {
+        "start": cmd_start,
+        "up": cmd_start,
+        "status": show_status,
+        "stop": cmd_stop,
+        "down": cmd_stop,
+        "restart": cmd_restart,
+        "log": cmd_log,
+        "logs": cmd_log,
+        "chat": cmd_chat,
+        "tui": cmd_chat,
+        "ui": cmd_ui,
+        "fix": cmd_fix,
+        "update": cmd_update,
+        "dashboard": cmd_ui,
+        "hold": cmd_hold,
+        "down": cmd_down,
+        "up": cmd_up,
+    }
+    # 単体の道具への通し窓を足す（表に載せるのはここだけ）
+    for 名 in 通す道具:
+        table.setdefault(名, lambda 名=名: cmd_通す(名))
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if cmd not in table:
+        # **行き止まりにしない。**~/bin に同じ名前の道具があるなら、
+        # 「それは claw の窓口ではない」と言うだけでは足りない。
+        # 打った側（人でもモデルでも）が次に何を打てばよいか書く。
+        隣 = os.path.join(os.path.dirname(os.path.abspath(__file__)), cmd)
+        print(f"知らないコマンド: {cmd}\n")
+        if os.path.exists(隣) and os.access(隣, os.X_OK):
+            print(f"  それは claw の窓口ではなく、単体の道具です。")
+            print(f"  そのまま打ってください: {cmd} " + " ".join(sys.argv[2:]))
+            print(f"  （`claw {cmd}` で通したいなら、claw の 通す道具 に1行足す）\n")
+        print(__doc__.strip())
+        return 1
+    return table[cmd]() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

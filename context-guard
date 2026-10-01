@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+context-guard — 会話が長くなりすぎる前に縮める。
+
+    context-guard            長すぎる会話を縮める（普段は無言）
+    context-guard --report   いまの長さを一覧で見せる（縮めない）
+    context-guard --dry-run  縮める対象だけ出して、実際には縮めない
+
+## なぜ要るか
+
+2026-09-09、Discord の会話が 41,345 トークンまで育ち、**6時間半まったく返らなく
+なった**。見た目は全部立っていて、見張りも「正常」と言い続けていた。
+
+本体にも自動圧縮はある。だが**閾値を変える口は 2026.9.2 で廃止された**
+（`compaction.reserveTokens` ほかが RETIRED_AGENT_TUNING_PATHS に入っている）。
+コードから読める既定は `reserveTokens = 16384`、つまり
+`65,536 − 16,384 ≒ 49,000` トークンあたりで初めて発火する計算になる。
+
+**その既定はクラウドのモデル向けである。**API のモデルなら 49,000 トークンでも
+数秒で返る。ローカルの 26B は 110 tok/s なので、同じ量が**7分半**になる。
+文脈の長さが、そのまま待ち時間になる機械では、既定が合っていない。
+
+## なぜ「%」ではなく「秒」で決めるか
+
+窓の何%かは、この機械では意味を持たない。効くのは
+**「いま冷えていたら、読み終わるまで何秒かかるか」**である。
+
+    110 tok/s のとき
+       6,500 トークン → 約 1 分
+      20,000 トークン → 約 3 分
+      41,000 トークン → 約 6 分   ← 実際に詰まったところ
+
+**「冷えても3分以内」を約束する**なら、上限は 20,000 トークンになる。
+本体の 49,000 には永久に届かないので、あちらの閾値が正しいかどうかも
+関係なくなる。**崖に着かないなら、崖の位置を知らなくてよい。**
+
+## やらないこと
+
+- **走っている会話は縮めない。**返事の途中で履歴を書き換えると、
+  そのターンが壊れる。
+
+  ここには見えない穴がある。走っている会話は `totalTokens` が `null`・
+  `totalTokensFresh` が `false` で返るので、下の `sessions()` の
+  `if not used` で**一覧に入る前に落ちる**（2026-09-12 実測。走行中 None →
+  終了後 27,070）。つまりここは**縮めないのではなく、見えていない**。
+
+  2026-09-11 の8時間25分は、まさにその穴に落ちた。あの晩この見張りは
+  10分おきに約50回巡回して他の2件は縮めたのに、当の Discord の会話には
+  一度も触れていない。**走り続けている会話は、ここの担当ではない。**
+  そちらは loop-guard が見る（`loop-guard --report`）。
+- **一度に1つだけ。**縮めるとその会話の前置きは全部読み直しになる。
+  何本も同時にやると、その全部が同時に冷える。
+- 手入れ中は動かない（`claw hold`）。
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, stand_down  # noqa: E402
+
+G = Guard("context-guard")
+# `--report` は読むだけ。鍵を取らせない。
+BIN = os.path.dirname(os.path.abspath(__file__))
+
+# 冷えたときの読み込み速度。実測 110 tok/s（gemma4:26b・この機械）。
+TOKENS_PER_SEC = 110
+# 冷えても、これ以内で読み終わること。ここが約束。
+COLD_BUDGET_SEC = 180
+# → 上限トークン数。約束から逆算する。**数字を直接書かない。**
+MAX_TOKENS = TOKENS_PER_SEC * COLD_BUDGET_SEC        # 19,800
+
+# これより新しい会話は「走っている最中かもしれない」ので触らない。
+BUSY_AGE_SEC = 90
+
+
+def sessions():
+    """会話の一覧。(名前, 使用トークン, 窓, 最終からの秒) を返す。
+
+    **`contextTokens` は窓の大きさで、使用量ではない。**使用量は `totalTokens`。
+    名前が紛らわしいので、ここで一度だけ読み替える。"""
+    try:
+        p = subprocess.run(["openclaw", "sessions", "list", "--json"],
+                           capture_output=True, text=True, timeout=180,
+                           stdin=subprocess.DEVNULL)
+        d = json.loads(p.stdout)
+    except Exception:
+        return []
+    rows = d if isinstance(d, list) else (d.get("sessions") or d.get("items") or [])
+    out = []
+    for r in rows:
+        used = r.get("totalTokens")
+        win = r.get("contextTokens")
+        if not used or not win:
+            continue
+        # 古い数字を根拠に履歴を書き換えない。
+        if r.get("totalTokensFresh") is False:
+            continue
+        out.append((str(r.get("key", "")), int(used), int(win),
+                    (r.get("ageMs") or 0) / 1000))
+    return sorted(out, key=lambda x: -x[1])
+
+
+def compact(key):
+    """1つ縮める。(縮んだか, 説明)。"""
+    try:
+        p = subprocess.run(["openclaw", "sessions", "compact", key],
+                           capture_output=True, text=True, timeout=600,
+                           stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return False, str(e)
+    out = (p.stdout + p.stderr).strip()
+    return p.returncode == 0, out[-200:]
+
+
+def main():
+    args = set(sys.argv[1:])
+    dry = "--dry-run" in args
+    report = "--report" in args
+
+    held, why = stand_down(G, dry or report)
+    if held:
+        return 0
+
+    rows = sessions()
+    if report:
+        print(f"上限 {MAX_TOKENS:,} トークン"
+              f"（冷えても {COLD_BUDGET_SEC}秒 以内・{TOKENS_PER_SEC} tok/s 換算）\n")
+        if not rows:
+            print("  使用量が読めませんでした")
+            return 1
+        for key, used, win, age in rows[:12]:
+            sec = used / TOKENS_PER_SEC
+            mark = "✗" if used > MAX_TOKENS else "●"
+            print(f"  {mark} {key[:46]:<48} {used:>6,}/{win:,}"
+                  f"  冷えたら {sec:>5.0f}秒")
+        return 0
+
+    over = [r for r in rows if r[1] > MAX_TOKENS and r[3] > BUSY_AGE_SEC]
+    if not over:
+        return 0
+
+    # **一度に1つだけ。**縮めた会話はその場で冷えるので、
+    # まとめてやると全部が同時に冷える。
+    key, used, win, age = over[0]
+    sec = used / TOKENS_PER_SEC
+    if dry:
+        print(f"縮める対象: {key}（{used:,} トークン・冷えたら {sec:.0f}秒）")
+        print(f"  ほかに {len(over) - 1} 件が上限を超えている")
+        return 0
+
+    G.log(f"{key} が {used:,} トークン（冷えたら {sec:.0f}秒）。縮める")
+    ok, said = compact(key)
+    if not ok:
+        G.tell_once(G.load_state(), f"failed:{key}",
+                    f"会話が長くなりすぎているのに、縮められませんでした。\n"
+                    f"  {key}\n  {used:,} トークン（冷えたら {sec:.0f}秒かかる）\n"
+                    f"  {said}\n"
+                    f"このままだと、その会話は返事が返らなくなります。")
+        return 1
+
+    G.log(f"縮めた: {said}")
+    G.notify(f"会話が長くなっていたので縮めました。\n"
+             f"  {key.split(':')[-2] if ':' in key else key}\n"
+             f"  {said}\n"
+             f"（{MAX_TOKENS:,} トークンを超えると、冷えたとき"
+             f"{COLD_BUDGET_SEC}秒 以上かかるため）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

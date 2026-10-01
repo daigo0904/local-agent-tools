@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""guardrun-実測 — 「N件中M件が期待どおり・被害0件・1回あたり◯ms」を実測で出す。
+
+    guardrun-実測 [guardrun.py の場所] [--回数 5]
+
+**期待は走らせる前にここへ書いてある。結果を見てから直さないこと。**
+（直すなら、直した理由と日付をケースの横に残す。黙って合わせると、
+照合が自分の答えを写すだけになる。）
+
+採点は guardrun 自身がする（受領証 形式版2 の 事後.照合）。この道具は数えるだけ。
+被害は受領証の外で確かめる（作業場の外のファイル・秘密の中身・通信・残ったプロセス）。
+受領証は使い捨ての置き場に書く（本物の実績を汚さない）。
+
+出すもの（最後の1行は JSON）:
+    照合     一致 / 不一致 / 未宣言 の件数と、不一致の中身
+    被害     攻撃ケースで実際に被害が出た件数（0 が正しい）
+    上乗せ   同じ命令を 壁なし と guardrun で走らせた時間の差（中央値・ms）
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+引数 = [a for a in sys.argv[1:] if not a.startswith("--")]
+PATH = 引数[0] if 引数 else os.path.expanduser("~/bin/guardrun.py")
+回数 = 5
+if "--回数" in sys.argv:
+    回数 = int(sys.argv[sys.argv.index("--回数") + 1])
+
+spec = importlib.util.spec_from_loader(
+    "guardrun_実測", importlib.machinery.SourceFileLoader("guardrun_実測", PATH))
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+
+PY = sys.executable
+窓 = os.name == "nt"
+HOME = os.path.expanduser("~")
+外の的 = os.path.join(HOME, "guardrun-実測-外に書けた.txt")
+囮 = os.path.join(HOME, ".guardrun-実測-秘密")
+
+# (名, 命令, 期待, 被害の確かめ or None, 追加の run 引数)
+# 期待は guardrun の設計から書いた（2026-09-24・母艦）。出典は印の試験と guardrun.py の注記。
+ケース = [
+    ("何もしない", "pass",
+     {"判定": "青", "終了コード": 0, "差分": {"追加": [], "削除": [], "変更": []}}, None, {}),
+    ("書く", "open('a','w').write('x')",
+     {"判定": "緑", "終了コード": 0, "差分": {"追加": ["a"]}}, None, {}),
+    ("直す", "open('前からある.txt','a').write('足した\\n')",
+     {"判定": "緑", "終了コード": 0, "差分": {"変更": ["前からある.txt"]}}, None, {}),
+    ("exit 3", "import sys;sys.exit(3)",
+     {"判定": "失敗", "終了コード": 3}, None, {}),
+    ("書いて exit 3", "import sys;open('a','w').write('x');sys.exit(3)",
+     {"判定": "失敗", "終了コード": 3}, None, {}),
+    ("書いて眠り続ける（壁時計）", "import time;open('a','w').write('x');time.sleep(60)",
+     {"判定": "青"}, None, {"wall_sec": 3}),
+    # ── 攻撃。被害は受領証の外で確かめる ──
+    ("作業場の外に書く", "open(%r,'w').write('ng')" % 外の的,
+     {"判定": "失敗"}, lambda w: os.path.exists(外の的), {}),
+    ("秘密を読む",
+     "n=0\ntry: n=len(open(%r,'rb').read())\nexcept Exception: pass\nopen('n','w').write(str(n))" % 囮,
+     {"判定": "緑", "差分": {"追加": ["n"]}},
+     lambda w: _読む(os.path.join(w, "n")) not in ("0", ""), {}),
+    ("外へ通信",
+     "import socket\nr='通った'\ntry: socket.create_connection(('1.1.1.1',443),3).close()\n"
+     "except Exception: r='止まった'\nopen('net','w').write(r)",
+     {"判定": "緑", "差分": {"追加": ["net"]}},
+     lambda w: _読む(os.path.join(w, "net")) != "止まった", {}),
+    ("前からある物を消す", "import os;os.unlink('前からある.txt')",
+     {"判定": "赤", "差分": {"削除": ["前からある.txt"]}}, None, {}),
+]
+if not 窓:
+    ケース += [
+        ("上限まで書く", "open('big','wb').write(b'x'*200000)",
+         {"判定": "失敗"}, None, {"max_file_bytes": 65536}),
+        ("孫を残して帰る",
+         "import subprocess,os\nsubprocess.Popen(['sleep','300'],start_new_session=True)",
+         {"判定": ["青", "緑", "失敗"]},     # 印は問わない。被害（孫が残る）だけを見る
+         lambda w: _孫が残っている(), {}),
+    ]
+
+
+def _読む(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _孫が残っている():
+    try:
+        o = subprocess.run(["pgrep", "-f", "^sleep 300$"], capture_output=True, text=True)
+        return bool(o.stdout.strip())
+    except OSError:
+        return False
+
+
+def 作業場():
+    base = "/Users/Shared" if sys.platform == "darwin" else None
+    w = tempfile.mkdtemp(prefix="gr-実測-", dir=base)
+    if not 窓:
+        os.chmod(w, 0o777)
+    with open(os.path.join(w, "前からある.txt"), "w", encoding="utf-8") as f:
+        f.write("もと\n")
+    return w
+
+
+def main():
+    根 = tempfile.mkdtemp(prefix="gr-実測-記録-")
+    with open(囮, "w", encoding="utf-8") as f:
+        f.write("これが読めたら秘密は守られていない。" * 4)
+    if os.path.exists(外の的):
+        os.unlink(外の的)
+    行, 数 = [], {"一致": 0, "不一致": 0, "未宣言": 0}
+    被害 = []
+    try:
+        for 名, 命令, 期待, 被害か, 追加 in ケース:
+            w = 作業場()
+            try:
+                引数 = dict(prove=False, 記録=根, 期待=期待, wall_sec=20)
+                引数.update(追加)
+                r = g.run([PY, "-c", 命令], w, **引数)
+                rc = json.load(open(r["受領証"], encoding="utf-8"))
+                照 = rc["事後"]["照合"]
+                数[照["結果"]] = 数.get(照["結果"], 0) + 1
+                害 = bool(被害か and 被害か(w))
+                if 害:
+                    被害.append(名)
+                行.append({"名": 名, "判定": rc.get("判定"), "照合": 照["結果"],
+                          "食い違い": 照.get("食い違い", []), "被害": 害 if 被害か else None})
+                print("%s %-16s 判定 %s／照合 %s%s%s" % (
+                    "○" if 照["結果"] == "一致" and not 害 else "✗", 名, rc.get("判定"), 照["結果"],
+                    "／" + "；".join(照.get("食い違い", [])) if 照.get("食い違い") else "",
+                    "／**被害あり**" if 害 else ""), flush=True)
+            finally:
+                shutil.rmtree(w, ignore_errors=True)
+                subprocess.run(["pkill", "-f", "^sleep 300$"], capture_output=True) if not 窓 else None
+
+        # ── 上乗せ：同じ命令を壁なしと guardrun で ──
+        # guardrun 側は prove=True（本番と同じ。証明は控えを使い回す）。
+        素, 壁 = [], []
+        g.run([PY, "-c", "pass"], 作業場(), 記録=根)     # 控えを温める（数えない）
+        for _ in range(回数):
+            w = 作業場()
+            t0 = time.perf_counter()
+            subprocess.run([PY, "-c", "pass"], cwd=w)
+            素.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            g.run([PY, "-c", "pass"], w, 記録=根)
+            壁.append(time.perf_counter() - t0)
+            shutil.rmtree(w, ignore_errors=True)
+        上乗せ = round((statistics.median(壁) - statistics.median(素)) * 1000)
+        print("上乗せ（中央値・%d回）: 壁なし %d ms／guardrun %d ms／差 %d ms" % (
+            回数, statistics.median(素) * 1000, statistics.median(壁) * 1000, 上乗せ))
+    finally:
+        for p in (囮, 外の的):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        shutil.rmtree(根, ignore_errors=True)
+
+    攻撃 = sum(1 for x in 行 if x["被害"] is not None)
+    print(json.dumps({"件数": len(行), "照合": 数, "攻撃": 攻撃, "被害": 被害,
+                      "上乗せms": 上乗せ, "壁なしms": round(statistics.median(素) * 1000),
+                      "guardrun_ms": round(statistics.median(壁) * 1000),
+                      "執行": g.pick_enforcer().name, "行": 行}, ensure_ascii=False))
+    return 0 if 数.get("不一致", 0) == 0 and not 被害 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

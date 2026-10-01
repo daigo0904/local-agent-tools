@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+# guardrun-窓の用意の試験 — Windows の執行の「用意」が、壁を作れなかったときに成功と言わないか。
+# Windows 実機が無くても回るよう subprocess を差し替える。書いたのは Codex（2026-09-24・C2）、入れる前に対照で確かめた
+# （直す前の版では1件目で落ちる）。guard-drill marks から毎朝回る。
+"""C2: Windows 実機を使わず、必須操作の失敗と後始末を確かめる。"""
+import sys
+sys.dont_write_bytecode = True
+
+import subprocess
+from unittest.mock import Mock, patch
+import guardrun as g
+
+
+def 試す(失敗条件=None, sid="S-1-5-21-123", 例外=False):
+    e = g.Windows別ユーザ()
+    e.公共の書き場 = ("/public",)
+    e._sid値 = sid  # 証明時に SID がキャッシュされている場合も測る。
+    e.皆殺し = Mock()
+    呼出 = []
+    c = {"書ける場所": ["/work"], "読める場所": ["/read", "/file"],
+         "読ませない": ["/secret", "/secret-file"]}
+
+    def run(argv, **kwargs):
+        呼出.append(argv)
+        if 失敗条件 and 失敗条件(argv):
+            if 例外:
+                raise OSError("mock permission lost")
+            return subprocess.CompletedProcess(argv, 1, "mock stdout", "mock access denied")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with patch.object(g.shutil, "which", side_effect=lambda name: name), \
+            patch.object(g.os.path, "exists", return_value=True), \
+            patch.object(g.os.path, "isdir", side_effect=lambda p: not p.endswith("file")), \
+            patch.object(g.subprocess, "run", side_effect=run), \
+            patch.object(e, "片付け", wraps=e.片付け) as cleanup:
+        結果 = e.用意(c, "/work", "/temp")
+        回数 = cleanup.call_count
+    return 結果, 回数, 呼出, e
+
+
+def 失敗を確認(名前, 条件, sid="S-1-5-21-123", 例外=False):
+    (ok, reason), count, calls, e = 試す(条件, sid, 例外)
+    assert ok is False, (名前, reason)
+    assert count == 1, (名前, count)
+    assert reason, 名前
+    if 条件 and not 例外:
+        assert "mock access denied" in reason and "mock stdout" in reason, reason
+    assert e._開けた == [] and e._塞いだ == [] and e._規則 is None
+    assert e.皆殺し.call_count == 1
+    granted = {a[1] for a in calls if a[0] == "icacls" and "/grant" in a}
+    removed = {a[1] for a in calls if a[0] == "icacls" and "/remove:g" in a}
+    assert granted <= removed, (granted, removed)
+    denied = {a[1] for a in calls if a[0] == "icacls" and "/deny" in a}
+    cleared = {a[1] for a in calls if a[0] == "icacls" and "/remove:d" in a}
+    assert denied <= cleared, (denied, cleared)
+    if any("New-NetFirewallRule" in a[-1] for a in calls):
+        assert any("Remove-NetFirewallRule" in a[-1] for a in calls)
+    print("PASS:", 名前)
+
+
+def main():
+    for path, name in [("/secret", "秘密フォルダの ACL 拒否失敗"),
+                       ("/secret-file", "秘密ファイルの ACL 拒否失敗"),
+                       ("/public", "公共の書き場の ACL 拒否失敗")]:
+        失敗を確認(name, lambda a, p=path: "/deny" in a and a[1] == p)
+    for path in ("/work", "/temp", "/read", "/file"):
+        失敗を確認("利用者への許可失敗 " + path,
+                   lambda a, p=path: "/grant" in a and "/T" not in a and a[1] == p)
+    失敗を確認("Firewall 作成失敗", lambda a: "New-NetFirewallRule" in a[-1])
+    失敗を確認("SID 取得失敗", None, sid="")
+    失敗を確認("ACL 実行例外", lambda a: "/deny" in a, 例外=True)
+    失敗を確認("PowerShell 実行例外", lambda a: "New-NetFirewallRule" in a[-1], 例外=True)
+    for name, condition in [("全部成功", None),
+                            ("既存ファイルへの再帰配布だけ失敗", lambda a: "/grant" in a and "/T" in a)]:
+        result, count, calls, e = 試す(condition)
+        assert result == (True, ""), result
+        assert count == 0
+        assert any("New-NetFirewallRule" in a[-1] and "-ErrorAction Stop" in a[-1]
+                   and "$ErrorActionPreference = 'Stop'" in a[-1] for a in calls)
+        assert any("/deny" in a for a in calls)
+        assert all("(OI)(CI)" not in a[3] for a in calls
+                   if a[0] == "icacls" and a[1].endswith("file"))
+        print("PASS:", name)
+    print("全13試験成功")
+
+
+if __name__ == "__main__":
+    main()

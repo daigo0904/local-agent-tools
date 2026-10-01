@@ -1,0 +1,2349 @@
+#!/usr/bin/env python3
+"""
+guard-drill — 見張りが本当に働くかを、わざと壊して確かめる。
+
+    guard-drill              安全な訓練だけ（サービスは止めない）
+    guard-drill --full       止まる訓練も含めて全部
+    guard-drill --list       何を試すか見る
+    guard-drill <名前>       1つだけ
+    guard-drill --dry-run    何をするかだけ見せる
+
+## なぜ要るか
+
+見張りは黙って壊れる。2026-08-30、watchdog は直っていないのに
+「入れ直した」とログに書いていた。launchctl kickstart が
+plist の外れた相手には効かないのに、戻り値を捨てていたためである。
+手で壊した側を試さなければ、この嘘は次の本物の障害まで見つからなかった。
+
+**黙って壊れた見張りは、健全な見張りと見た目が同じ。**
+この一式が扱っている問題が、見張り自身に返ってきている形なので、
+「動くはず」ではなく「動くことを見せろ」に切り替える。
+
+## 訓練が障害にならないための決まり
+
+1. 壊す前に、戻し方を先に決める。決められないものは訓練にしない。
+2. どの項目も、終わったら**戻ったことを確かめる**。確かめずに次へ進まない。
+3. 途中で失敗しても、**残りは走らせる**。止めるのは「家が傷んだとき」だけ。
+   （2026-09-13 に直した。それまでは1つ落ちた時点で打ち切っていたので、
+   05:30 の定時実行は3番目の `spin` が落ちて**後ろの11項目が走らなかった**。
+   `silent` `escape` `limits` は、そこから毎日ずっと試されていなかったことになる。
+   **早い順番の項目が落ちていると、その後ろが黙って試されなくなる**——
+   この一式がいちばん嫌う形が、訓練自身に出ていた。）
+4. 走っているあいだは印を置く。見張りの記録を後から読む人が、
+   本物の障害と訓練を取り違えないため。
+5. サービスが実際に止まる訓練は、既定では走らせない（--full のときだけ）。
+"""
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import (Guard, pulse_age, PULSE_DIR, OPENCLAW, 鍵を試す, 鍵を返す,  # noqa: E402
+                      KICK_FILE, settling, atomic_write, notify_target,
+                      stand_down, 道具の呼び方)
+
+G = Guard("guard-drill")
+
+# 手入れ中で見送ってよい回数。この訓練は1日1回なので、3回＝3日。
+# watchdog が「訓練が古い」と判断するのも3日なので、そこに合わせてある。
+SKIP_MAX = 3
+MARK_FILE = os.path.join(OPENCLAW, "drill-in-progress")
+
+# **道具の在り処は差し替えられるようにしておく。**
+# 壊し試験（guard-drill-mutants）が、見張りを「何もしない版」に置き換えた
+# 写しの束を指して同じ項目を走らせ、**落ちるかどうか**を見るために使う。
+# 既定は本物なので、ふだんの振る舞いは変わらない。
+BIN = os.environ.get("GUARD_DRILL_BIN") or os.path.expanduser("~/bin")
+# **OPENCLAW は状態ディレクトリ（~/.openclaw）であって実行ファイルではない。**
+# ここを取り違えると run() が黙って None を返し、判定が「未設定」に化ける。
+CLAW_BIN = "/opt/homebrew/bin/openclaw"
+GATEWAY_PORT = 18789
+GATEWAY_PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.openclaw.gateway.plist")
+
+
+# ── 小道具 ────────────────────────────────────────────────
+def width(text):
+    """画面上の幅。日本語は2文字ぶん取るので、len では桁が揃わない。"""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def pad(text, to):
+    return text + " " * max(0, to - width(text))
+
+
+def say(mark, text, detail=""):
+    print(f"  {mark} {pad(text, 24)}" + (f"  {detail}" if detail else ""), flush=True)
+
+
+OK, NG, DOT = "\033[32m●\033[0m", "\033[31m●\033[0m", "\033[90m·\033[0m"
+
+
+def run(args, timeout=120):
+    """**家の道具は、その OS での呼び方に並べ直してから渡す。**"""
+    args = 道具の呼び方(args)
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def port_open(port):
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def wait_until(fn, seconds, step=1.0):
+    """条件が満たされるまで待つ。戻すときに必ず使う（待たずに次へ進まない）。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        if fn():
+            return True
+        time.sleep(step)
+    return fn()
+
+
+# 止める・動かすは、番号ではなく名前で送る。
+#
+# 番号を直書きしていて、macOS で一度も止められていなかった。
+# macOS は SIGSTOP=17 / SIGCONT=19、Linux は SIGSTOP=19 / SIGCONT=18 と逆で、
+# Linux の 19 を「止める」のつもりで送っていたので、実際には「動かす」だった。
+# 訓練は何も壊さないまま「通った」と報告していた。
+def proc_state(pid):
+    r = run(["ps", "-p", str(pid), "-o", "state="])
+    return (r.stdout.strip() if r and r.stdout else "")
+
+
+def resume(pid, seconds=20):
+    """止めた相手を動かし直す。**状態を見て、動くまで送り続ける。**
+
+    一度送って終わりにしていたら、止まったまま「戻した」と報告していた。
+    実際にそうなり、ollama がポートだけ握って答えない状態で残った。
+    kickstart の嘘と同じ形で、確かめずに書いたのが原因である。"""
+    if not pid:
+        return True
+    end = time.time() + seconds
+    while time.time() < end:
+        st = proc_state(pid)
+        if not st:                       # もう居ない（誰かが入れ直した）
+            return True
+        if "T" not in st:                # 動いている
+            return True
+        try:
+            os.kill(int(pid), signal.SIGCONT)
+        except (OSError, ProcessLookupError):
+            return True
+        time.sleep(0.5)
+    return "T" not in proc_state(pid)
+
+
+def healthy():
+    """いま一式が本当に動いているか。訓練の後始末はここが緑になるまで終わらない。
+
+    **OK だけを正常とみなしてはいけない。**
+    model-guard --check は3通り返す。
+
+        OK    … 1トークン返せた
+        SKIP  … 誰かの依頼を処理中なので点検を見送った
+        NG    … 返ってこない
+
+    ここは長らく `startswith("OK")` しか見ておらず、SKIP を「壊れている」と
+    読んでいた。ollama は同時1件しか処理しないので、**誰かが使っている間は
+    必ず SKIP になる**。つまり普通に使われている時間帯に訓練が走ると、
+    何も壊れていないのに「訓練が壊したまま戻っていない。手で見ること」と
+    出る。しかも使われているかどうかで結果が変わるので、日によって出たり
+    出なかったりする。
+
+    後始末の確認は「訓練が傷を残したか」を見る場所で、ここが理由もなく
+    赤くなると、**本当に傷が残った日に信じてもらえなくなる**。
+    SKIP は誰かが実際にモデルを使えているということなので、
+    むしろ動いている証拠として扱う。"""
+    r = run([os.path.join(BIN, "model-guard"), "--check"], timeout=300)
+    if not r or not r.stdout.startswith(("OK", "SKIP")):
+        return False
+    return port_open(GATEWAY_PORT)
+
+
+def lock_free(guard_name):
+    """その見張りの鍵が空いているか。
+
+    相手が止まっているあいだ、定期実行の見張りは点検の時間切れ（最大90秒）
+    ずっと鍵を握る。訓練が同じ時間に呼ぶと、黙って引き返したぶんを
+    「試した」と数えてしまい、8回呼んで1回も動いていない状態になった。"""
+    try:
+        f = open(os.path.join(OPENCLAW, f"{guard_name}.lock"), "w")
+        取れた = 鍵を試す(f)
+        if 取れた:
+            鍵を返す(f)
+        f.close()
+        return 取れた
+    except OSError:
+        return False
+
+
+def poke_until_noticed(guard_name, mark, args, seconds, env=None):
+    """見張りが記録を残すまで、鍵の空いた隙に呼び続ける。
+
+    記録が伸びれば、誰が呼んだぶんでもよい（定期実行が先に気づくこともある）。
+    見たいのは「この故障に見張りが気づいたか」であって、呼び出し元ではない。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        if log_lines(guard_name) > mark:
+            return True
+        if lock_free(guard_name):
+            subprocess.run(args, capture_output=True, timeout=300,
+                           env=env or os.environ)
+        else:
+            time.sleep(3)
+    return log_lines(guard_name) > mark
+
+
+def poke_until_line(guard_name, mark, args, want, seconds):
+    """見張りが、その一行を書くまで呼び続ける。
+
+    「記録が伸びたか」だけで待つと、途中の『連続1回』が出た時点で
+    次へ進んでしまい、手当てまで見届けられない（実際に16秒で落ちた）。
+    見たいのは特定の結末なので、その言葉が出るまで待つ。"""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            with open(os.path.join(OPENCLAW, "logs", f"{guard_name}.log")) as f:
+                if any(want in l for l in f.readlines()[mark:]):
+                    return True
+        except OSError:
+            pass
+        if lock_free(guard_name):
+            subprocess.run(args, capture_output=True, timeout=300)
+        else:
+            time.sleep(3)
+    return False
+
+
+def log_lines(guard_name):
+    """その見張りの記録の行数。訓練の前後で比べて、気づいたかを見る。"""
+    try:
+        with open(os.path.join(OPENCLAW, "logs", f"{guard_name}.log")) as f:
+            return len(f.readlines())
+    except OSError:
+        return 0
+
+
+def noticed(guard_name, before, want):
+    """訓練のあいだに、その見張りが本当に気づいて動いたか。
+
+    **ここが訓練の本体である。**サービスが戻ったことだけを見ていると、
+    こちらが後始末で戻したぶんを「見張りが直した」と取り違える。
+    実際そうなり、見張りが1行も記録していないのに「通った」と表示した。
+
+    さらに悪いことに、gateway の合否にポートの開閉を使っていた。
+    止めたプロセスもポートは握ったままなので、必ず「開いている」と出る。
+    **この一式が存在する理由そのものを、訓練の中で間違えていた。**
+    """
+    try:
+        with open(os.path.join(OPENCLAW, "logs", f"{guard_name}.log")) as f:
+            new_lines = f.readlines()[before:]
+    except OSError:
+        return False, "記録が読めない"
+    hit = [l for l in new_lines if any(w in l for w in want)]
+    if not hit:
+        return False, "見張りが気づいた形跡がない（記録に1行も出ていない）"
+    return True, hit[-1].strip()
+
+
+def set_pulse(name, minutes_ago):
+    p = os.path.join(PULSE_DIR, f"{name}.json")
+    at = datetime.fromtimestamp(time.time() - minutes_ago * 60)
+    atomic_write(p, json.dumps({"at": at.isoformat(timespec="seconds")}))
+
+
+class keep_state:
+    """訓練のあいだ、その見張りの覚え書きを預かって、終わったら戻す。
+
+    **訓練は本物の見張りに偽の故障を見せる。** 見張りは正直に数えるので、
+    「連続13回失敗している」「05:30から落ちたままだ」という嘘が
+    本物の覚え書きに残っていた（実際 fails:13 / down_since:05:30 が残っていた）。
+    次に本物の障害が起きたとき、その数字から始まることになる。
+
+    壊す前に戻し方を決める、という訓練の決まりは、
+    **サービスだけでなく見張りの記憶にも要る**。"""
+
+    def __init__(self, *names):
+        self.paths = [os.path.join(OPENCLAW, f"{n}-state.json") for n in names]
+        self.saved = {}
+
+    def __enter__(self):
+        for p in self.paths:
+            try:
+                with open(p) as f:
+                    self.saved[p] = f.read()
+            except OSError:
+                self.saved[p] = None
+        return self
+
+    def __exit__(self, *exc):
+        for p, body in self.saved.items():
+            if body is None:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            else:
+                atomic_write(p, body)
+        return False
+
+
+def clear_kick_budget():
+    """「さっき蹴ったばかり」の記録を消す。
+
+    見張りは同じ相手を5分に1回しか蹴らないようにしてある（蹴り合いを止めるため）。
+    訓練はそのすぐ後に「蹴るはず」を確かめるので、予算が残っていると
+    **直っているのに落ちた**と報告してしまう。壊すのと同じで、
+    訓練のためにここを空けるのは、訓練の一部として明示しておく。"""
+    try:
+        os.unlink(KICK_FILE)
+    except OSError:
+        pass
+
+
+def wait_out_settling(limit=420):
+    """寝起きの猶予が明けるまで待つ。明けたら True。
+
+    見張りは寝起きのあいだ「古い心拍」で判断しない（寝ている間は誰も
+    心拍を打てないので、古くて当たり前だから）。訓練はまさにその
+    「古い心拍」を作って試すので、猶予中に走らせると必ず見送りになる。
+
+    **ここは見送らずに待つ。** 訓練は毎日05:30に走るが、
+    launchd の定時実行は**寝ていたMacを起こして走る**ので、
+    「起きたばかり」は例外ではなく**毎日の普通の状態**になる。
+    見送りで済ませると、いちばん確かめたい2つ（心拍の相互監視と、
+    両方同時に倒れる形）が**毎日素通り**して、しかも緑の●で「通った」と出る。
+    それは見張りが「直した」と嘘をつくのと同じ形なので、待つほうを選ぶ。
+
+    猶予は5分なので、7分待てば足りる。それでも明けないなら素直に見送る。"""
+    if not settling():
+        return True
+    return wait_until(lambda: not settling(), limit, 5)
+
+
+# ── 訓練 ──────────────────────────────────────────────────
+# 返すのは (通ったか, 説明)。どの訓練も、壊した状態で return しない。
+
+def drill_pulse():
+    """心拍を巻き戻して、相互監視が相手を蹴り起こすか。"""
+    if not wait_out_settling():
+        return True, "寝起きの猶予が明けないので見送り"
+    before = pulse_age("model-guard")
+    clear_kick_budget()
+    set_pulse("model-guard", 30)
+    r = run([os.path.join(BIN, "watchdog"), "--report"], timeout=180)
+    if r is None:
+        return False, "watchdog が返ってこない"
+    if "30分止まっている" not in r.stdout:
+        return False, f"止まっているのに気づかない（{r.stdout.splitlines()[0] if r.stdout else '出力なし'}）"
+    # 蹴った結果、心拍が新しくなっているはず
+    if not wait_until(lambda: (pulse_age("model-guard") or 999) < 120, 60):
+        return False, "気づいたが、蹴っても心拍が戻らない"
+    return True, f"気づいて蹴り起こした（前回は {int(before or 0)} 秒前）"
+
+
+def drill_standoff():
+    """**両方の心拍を同時に巻き戻して、蹴り合いにならないか。**
+
+    2026-08-31、これが起きて23分止まった。Mac が32分寝て、起きた瞬間に
+    watchdog と model-guard の心拍が同時に古くなった。そこから、
+
+        watchdog    → model-guard を kickstart -k（走っていれば殺す）で蹴る
+        model-guard → watchdog    を同じやり方で蹴る
+
+    どちらも起動直後に相手を蹴るので、**どちらも心拍を書く前に殺され続けた**。
+    心拍が新しくならないから、相手からは永久に死んで見える。
+    50回ずつ「蹴った（成功）」と記録しながら、一度も直っていなかった。
+
+    **この訓練が無かったから、見逃した。**
+    それまでの訓練（drill_pulse）は片方の心拍しか巻き戻していない。
+    片方だけなら、蹴られた側は普通に起きて心拍を書くので、何も起きない。
+    実際に困るのは**両方が同時に倒れたとき**で、そちらは一度も試していなかった。
+    寝て起きれば毎回そうなるので、珍しい形でもなかった。
+
+    ## ここで手を出さないこと
+
+    最初に書いたとき、心拍を戻したあと**両方を手で走らせて**から見ていた。
+    それだと手で走らせたぶんが必ず心拍を書くので、**どう転んでも通る訓練**になる。
+    1秒・0回で「通った」と出て、危ない道を一度も通っていなかった。
+    この一式が扱っている問題（直っていないのに直ったと書く）が、
+    訓練の中で再現していたことになる。
+
+    倒したあとは launchd の定期実行に任せて、**待って見るだけ**にする。
+    見るのは2つ。
+      1. 両方の心拍が、決めた時間内に戻ること（＝抜け出せる）
+      2. そのあいだに「相手が止まっている」と判断した回数が常識の範囲であること
+         （事故のときは8分で約100回だった。正常なら数回で収まる）
+    """
+    if not wait_out_settling():
+        return True, "寝起きの猶予が明けないので見送り"
+
+    clear_kick_budget()
+    marks = {n: log_lines(n) for n in ("model-guard", "watchdog")}
+
+    # 寝起きと同じ形を作る。どちらも「止まっている」と判断される古さにする。
+    set_pulse("model-guard", 30)
+    set_pulse("watchdog", 30)
+
+    # **ここから手を出さない。** 1分おきの定期実行だけで抜け出せるかを見る。
+    # 抜け出せるなら2巡（2分）で戻る。5分待って戻らないなら殴り合っている。
+    t0 = time.time()
+    got_out = wait_until(
+        lambda: (pulse_age("model-guard") or 9999) < 120
+        and (pulse_age("watchdog") or 9999) < 120, 300, 5)
+    took = int(time.time() - t0)
+
+    # 「相手が止まっている」と判断した回数を数える。蹴ったかどうかではなく、
+    # **何回そう判断したか**を見る（蹴らずに見送った回も、判断は起きている）。
+    alarms = 0
+    for name, mark in marks.items():
+        try:
+            with open(os.path.join(OPENCLAW, "logs", f"{name}.log")) as f:
+                alarms += sum(1 for l in f.readlines()[mark:]
+                              if "止まっている" in l or "心拍が無い" in l)
+        except OSError:
+            pass
+
+    if not got_out:
+        return False, (f"両方が同時に倒れると抜け出せない"
+                       f"（5分待っても心拍が戻らない・この間に {alarms} 回さわいでいる）")
+    if alarms > 6:
+        return False, (f"{took}秒で抜け出せたが、{alarms} 回さわいでいる"
+                       f"＝互いを死んだと読み続けている")
+    return True, f"両方同時に倒れても {took}秒 で戻った（さわいだのは {alarms} 回）"
+
+
+def drill_interval():
+    """**plist に書いてある間隔と、コードが思っている間隔が合っているか。**
+
+    見張りのしきい値は「何回続けてダメだったら」で書いてある。
+    その回数は「何分待ちたいか」÷「何秒おきに走るか」で決めた数なので、
+    plist の間隔を変えると、**コードを一行も触っていないのに待ち時間が変わる**。
+
+    実際こうなっていた（2026-08-31 に発見）。
+
+        watchdog    説明文「5分おき」・定数の注「3分おき」・plist 60秒
+        model-guard 段取りの注「2分おき」・見送りの注「60秒おき」・plist 60秒
+
+    そのせいで「答えないなら6分待つ」と書いてある gateway の入れ直しが、
+    実際には**2分**で動いていた。冷えたモデルの読み込みだけで36秒かかるのに、
+    一度の遅れで殺さないための余裕が1/3しか無かったことになる。
+    数字が3つに割れていても、誰も落ちないので気づけない。だからここで数える。
+    """
+    # **間隔は窓口から取る。**plist を直に読むと、その仕組みが無い機械では
+    # 中身の食い違いではなく「plist が読めない」で落ちる（2026-09-23、Linux で実際に）。
+    import schedlib
+    台帳 = schedlib.一覧()
+    bad = []
+    checked = []
+    for label, script in (("ai.openclaw.model-guard", "model-guard"),
+                          ("ai.openclaw.watchdog", "watchdog")):
+        c = 台帳.get(label)
+        if not c:
+            bad.append("%s: %s に登録されていない（この機械では間隔を確かめられない）"
+                       % (script, schedlib.仕組み() or "常駐・定時の仕組みが無い"))
+            continue
+        want = c.get("間隔")
+        got = None
+        try:
+            for line in open(os.path.join(BIN, script)):
+                if line.startswith("INTERVAL_S"):
+                    got = int(line.split("=", 1)[1].split("#")[0].strip())
+                    break
+        except (OSError, ValueError):
+            pass
+        if got is None:
+            bad.append(f"{script}: コードに INTERVAL_S が無い")
+        elif want != got:
+            bad.append(f"{script}: plist は {want}秒 なのにコードは {got}秒 のつもり")
+        else:
+            checked.append(f"{script}={got}秒")
+    if bad:
+        return False, " / ".join(bad)
+    return True, "登録とコードの間隔が一致（" + " ".join(checked) + "）"
+
+
+def drill_notify():
+    """**知らせが届く先が生きているか。**
+
+    2026-08-31、見張りが2人とも死んだという一番知らせるべき知らせが、
+    約100回ぶん全部 "Discord に送れなかった" で消えた。鍵も宛先も正しく、
+    起き抜けでネットがまだ立ち上がっていなかっただけだった。
+    それでも困るのは、**届いていないことを誰も知らなかった**こと。
+
+    ここでは1通も送らない。毎日届く「点検です」は、そのうち読まれなくなり、
+    本物の警報と一緒に埋もれる。宛先を GET するだけで、
+    鍵・宛先・経路の3つが生きているかは分かる。
+
+    あわせて、届かなかったぶんが溜まる仕組みも見る。
+    2026-08-31 に足したもので、ここが効かなければ、また同じように消える。"""
+    ok, detail = notify_target()
+    if not ok:
+        return False, detail
+
+    # 溜める仕組みが生きているか（書き捨ての場所で試す）
+    import guardlib
+    keep = guardlib.PENDING_FILE
+    probe = os.path.join(tempfile.mkdtemp(prefix="drill-notify-"), "pending.jsonl")
+    try:
+        guardlib.PENDING_FILE = probe
+        g = Guard("guard-drill")
+        g._hold("訓練: 届かなかった知らせ")
+        g._hold("訓練: 届かなかった知らせ")
+        rows = g._pending()
+        if len(rows) != 1 or rows[0].get("count") != 2:
+            return False, f"届かない知らせが溜まらない（{len(rows)}件）"
+    finally:
+        guardlib.PENDING_FILE = keep
+        shutil.rmtree(os.path.dirname(probe), ignore_errors=True)
+    return True, f"{detail}・届かないぶんは溜まる"
+
+
+def drill_lock():
+    """同時に2つ走らないか（二重に手を出すと、直すつもりで壊す）。"""
+    lock = os.path.join(OPENCLAW, "watchdog.lock")
+    # **pgrep が無い機械では、走っているかを確かめられない。**
+    # 返りを見ずに .stdout を読むと、その機械では訓練自体が落ちる（2026-09-23、Windows で）。
+    if run(["pgrep", "-f", "bin/watchdog"]) is None:
+        return None, "この機械には pgrep が無いので、二重に走らない鍵を試せない"
+    if not wait_until(lambda: not (run(["pgrep", "-f", "bin/watchdog"]) or
+                                   type("x", (), {"stdout": ""})).stdout.strip(), 60, 2):
+        return False, "watchdog が走り続けていて試せない"
+    f = open(lock, "w")
+    try:
+        if not 鍵を試す(f):
+            raise OSError("鍵が取れない")
+    except OSError:
+        return False, "鍵を取れないので試せない"
+    try:
+        t0 = time.time()
+        run([os.path.join(BIN, "watchdog")], timeout=180)
+        took = time.time() - t0
+    finally:
+        鍵を返す(f)
+        f.close()
+    if took > 2:
+        return False, f"鍵が効いていない（{took:.1f}秒かけて点検した）"
+    return True, f"{took:.2f}秒で引き返した"
+
+
+def drill_guardlib():
+    """共有部品が壊れたとき、検査が気づくか（guardlib / modellib / netlib）。
+
+    本物は触らない。写しを壊して、検査がそれを落とせるかだけ見る。
+    ここが効かないと、共有にした代償を払っただけになる。"""
+    tmp = tempfile.mkdtemp(prefix="drill-lib-")
+    try:
+        # guardlib は見張りが、modellib と netlib は道具がそれぞれ土台にしている。
+        # どれも壊れると、乗っている側が丸ごと動かなくなる。
+        for name in ("guardlib.py", "modellib.py", "netlib.py"):
+            src = os.path.join(BIN, name)
+            broken = os.path.join(tmp, name)
+            shutil.copy2(src, broken)
+            with open(broken, "a") as f:
+                f.write("\ndef こわす(  # わざと壊す\n")
+            r = run([sys.executable, broken, "--selftest"], timeout=60)
+            if r is not None and r.returncode == 0:
+                return False, f"{name}: 壊れているのに検査が通ってしまう"
+            good = run([sys.executable, src, "--selftest"], timeout=60)
+            if good is None or good.returncode != 0:
+                return False, f"{name}: 本物の検査が通らない"
+        return True, "壊れた写しは落ち、本物は通る（guardlib / modellib / netlib）"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def drill_qwc():
+    """コードを書く側の壊れ方を、qwc-guard が見分けるか。
+
+    本物の qwc は触らない。偽物にすげ替えて試す。"""
+    tmp = tempfile.mkdtemp(prefix="drill-qwc-")
+    stubs = {
+        "起動しない": '#!/bin/sh\nexit 3\n',
+        "勝手に書き換える": '#!/bin/sh\n[ "$1" = "--version" ] && { echo "qwc 0.2.0"; exit 0; }\n'
+                            'echo "むらさきいろのかもめ"\necho x > hello.txt\nexit 0\n',
+        "読めていない": '#!/bin/sh\n[ "$1" = "--version" ] && { echo "qwc 0.2.0"; exit 0; }\n'
+                        'echo "わかりません"\nexit 0\n',
+        "ゴミを作る": '#!/bin/sh\n[ "$1" = "--version" ] && { echo "qwc 0.2.0"; exit 0; }\n'
+                      'echo "むらさきいろのかもめ"\ntouch memo.txt\nexit 0\n',
+    }
+    missed = []
+    try:
+      with keep_state("qwc-guard"):
+        for label, body in stubs.items():
+            p = os.path.join(tmp, "qwc")
+            with open(p, "w") as f:
+                f.write(body)
+            os.chmod(p, 0o755)
+            env = dict(os.environ, QWC_GUARD_BIN=p)
+            r = subprocess.run(道具の呼び方([os.path.join(BIN, "qwc-guard"), "--check"]),
+                               capture_output=True, text=True, timeout=300, env=env)
+            if r.returncode == 0:
+                missed.append(label)
+        if missed:
+            return False, "見逃した: " + " / ".join(missed)
+        return True, f"{len(stubs)} 通りの壊れ方を全部見分けた"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def drill_ollama():
+    """頭脳を本当に止めて、model-guard が戻すか。**しばらく返事が来なくなる。**"""
+    serve = run(["pgrep", "-f", "ollama serve"])
+    pid = serve.stdout.split()[0] if serve and serve.stdout.strip() else None
+    if not pid:
+        return False, "ollama serve が見つからない"
+    runner = run(["pgrep", "-f", "llama-server"])
+    rpid = runner.stdout.split()[0] if runner and runner.stdout.strip() else None
+
+    mark = log_lines("model-guard")
+    os.kill(int(pid), signal.SIGSTOP)
+    if rpid:
+        os.kill(int(rpid), signal.SIGSTOP)
+    try:
+        env = dict(os.environ, MODEL_GUARD_TIMEOUT="15")
+        t0 = time.time()
+        # 気づくまで（最大4分）。そのあと、手を出すところまで見届ける。
+        poke_until_noticed("model-guard", mark, [os.path.join(BIN, "model-guard")], 240, env)
+        poke_until_noticed("model-guard", log_lines("model-guard"),
+                           [os.path.join(BIN, "model-guard")], 180, env)
+        took = time.time() - t0
+    finally:
+        # 生き残っていたら必ず動かし直す。**戻ったことを見てから抜ける。**
+        for p in (rpid, pid):
+            resume(p)
+    if not wait_until(healthy, 180, 5):
+        return False, "訓練のあと頭脳が戻らない。手で見ること"
+    saw, detail = noticed("model-guard", mark, ["応答なし"])
+    if not saw:
+        return False, detail
+    fixed, _ = noticed("model-guard", mark, ["入れ直した", "落とした", "復旧"])
+    if not fixed:
+        return False, f"気づいたが手を出していない（{detail}）"
+    return True, f"{int(took)}秒で気づいて手を出した"
+
+
+def _watchdogの値(名, 既定):
+    """watchdog のしきい値を、**あちらのソースから読む。**
+
+    こちらに数字を書き写すと、あちらを変えた日から訓練が嘘をつく。
+    2026-09-12、まさにそれで落ちた：訓練は watchdog を**2回**突いて
+    「入れ直した」を待っていたが、watchdog は**6回**続けて黙って初めて
+    入れ直す（`SILENT_BEFORE_RESTART = rounds(6)`）。**永久に通らない訓練**
+    だったが、`--full` を誰も走らせていなかったので13日間気づかなかった
+    （訓練ログ 08-30 以降、重い項目の記録は今日の2件だけ）。"""
+    import importlib.util
+    try:
+        s = importlib.util.spec_from_loader(
+            "watchdog_定数",
+            importlib.machinery.SourceFileLoader("watchdog_定数",
+                                                 os.path.join(BIN, "watchdog")))
+        m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(m)
+        return getattr(m, 名, 既定)
+    except Exception:
+        return 既定
+
+
+def drill_gateway():
+    """受け口を黙らせて、watchdog が入れ直すか。**LINE と Discord が数秒切れる。**"""
+    pids = run(["lsof", "-nP", "-iTCP:18789", "-sTCP:LISTEN", "-t"])
+    pid = pids.stdout.split()[0] if pids and pids.stdout.strip() else None
+    if not pid:
+        return False, "gateway が見つからない"
+
+    state = os.path.join(OPENCLAW, "watchdog-state.json")
+    saved = open(state).read() if os.path.exists(state) else None
+    if os.path.exists(state):
+        os.remove(state)
+
+    mark = log_lines("watchdog")
+    os.kill(int(pid), signal.SIGSTOP)          # 立っているのに答えない状態
+    try:
+        t0 = time.time()
+        # **気づくところまで**は、記録が伸びれば分かる。
+        poke_until_noticed("watchdog", mark, [os.path.join(BIN, "watchdog")], 180)
+        # **手当てまで見届ける。**watchdog は「連続で何回黙ったか」で動くので、
+        # その回数ぶん突く。回数はあちらのソースから読む（写すとずれる）。
+        必要 = _watchdogの値("SILENT_BEFORE_RESTART", 6)
+        poke_until_line("watchdog", mark, [os.path.join(BIN, "watchdog")],
+                        "入れ直", 必要 * 40 + 120)
+        took = time.time() - t0
+    finally:
+        resume(pid)
+        if saved is not None:
+            with open(state, "w") as f:
+                f.write(saved)
+
+    # **ポートの開閉では判定しない。**止めたプロセスもポートは握ったままなので、
+    # 必ず「開いている」と出る。見た側が「開いているのに答えない」を扱う一式で、
+    # 訓練だけがポートを信じていた。
+    if not wait_until(healthy, 180, 5):
+        return False, "訓練のあと受け口が戻らない。手で見ること"
+    saw, detail = noticed("watchdog", mark, ["gateway が"])
+    if not saw:
+        return False, detail
+    fixed, _ = noticed("watchdog", mark, ["入れ直して戻った", "入れ直した"])
+    if not fixed:
+        return False, f"気づいたが入れ直していない（{detail}）"
+    return True, f"{int(took)}秒で気づいて入れ直した"
+
+
+def drill_config():
+    """設定を壊して、動いた形に戻せるか。**受け口が一時的に止まる。**
+
+    入れ直しても戻らないときの最後の決定論的な手当て。
+    ここが効かないと、設定を触った瞬間に戻れなくなる。"""
+    cg = os.path.join(BIN, "config-guard")
+    conf = os.path.join(OPENCLAW, "openclaw.json")
+    if not os.path.exists(cg):
+        return False, "config-guard が無い"
+    if subprocess.run(道具の呼び方([cg]), capture_output=True, text=True).stdout.count("まだ無い"):
+        return False, "「動いた形」がまだ記録されていない"
+
+    # **watchdog の「入れ直した直後」を消してから始める。**
+    # 2026-09-12、`--full` で gateway の訓練の直後に走ったら、あちらの
+    # 入れ直しで 900秒のクールダウンに入っており、**誰も直せない時間帯に
+    # 設定を壊した**（watchdog のログ「入れ直した直後なので待つ」）。
+    # 訓練は「手当てが効くか」を見るものなので、手当てが構造的に
+    # 動けない状態から始めてはいけない。gateway の訓練と同じ作法で
+    # 覚えを預かって、終わったら戻す。
+    state = os.path.join(OPENCLAW, "watchdog-state.json")
+    saved = open(state).read() if os.path.exists(state) else None
+    if os.path.exists(state):
+        os.remove(state)
+
+    mark = log_lines("watchdog")
+    with open(conf, "a") as f:
+        f.write("\nこれは訓練で壊した行\n")
+    import schedlib
+    schedlib.蹴る("ai.openclaw.gateway", 殺す=True)
+    try:
+        # 壊れた設定で本当に落ちるまで待つ。落ちる前に見張りを呼んでも意味がない。
+        if not wait_until(lambda: not port_open(GATEWAY_PORT), 60, 2):
+            return False, "設定を壊しても受け口が落ちない（訓練にならない）"
+        # 見張りは連続3回で手を出す。その結末が記録に出るまで待つ。
+        # **待つ長さも、あちらの数字から出す。**420秒の決め打ちでは
+        # 9ラウンド分（各ラウンドは health の時間切れ最大30秒）に足りず、
+        # 2026-09-13 は watchdog が手当てに入る**24秒前に**訓練が諦めていた。
+        # 「落ちた」の理由が、直っていないのか待ち足りないのか区別できなくなる。
+        回数 = _watchdogの値("DOWN_BEFORE_RESTART", 9)
+        一回 = _watchdogの値("HEALTH_TIMEOUT", 30)
+        poke_until_line("watchdog", mark, [os.path.join(BIN, "watchdog")],
+                        "設定を動いた形に戻して復旧した",
+                        (回数 + 2) * (一回 + 5) + 120)
+    finally:
+        # 見張りが戻せなかった場合に備えて、こちらでも必ず戻す。
+        # **いまの config-guard の作法で呼ぶこと。**`--rollback` だけでは
+        # 「ゲートウェイが登録されたままです。戻しませんでした」で**拒否される**
+        # （2026-09-06 に足した正しい振る舞い）。訓練の後始末だけがその前の
+        # 呼び方のまま残っていて、2026-09-12 に**家を10分落とした**。
+        # 拒否が正しいのだから、合わせるのはこちら側。
+        subprocess.run(道具の呼び方([cg, "--rollback", "--stop-gateway", "--quiet"]),
+                       capture_output=True, timeout=120)
+        # `--stop-gateway` は登録ごと外すので kickstart では起きない。
+        # 登録して起こすのは claw の仕事。
+        subprocess.run(道具の呼び方([os.path.join(BIN, "claw")]), capture_output=True,
+                       timeout=180)
+        if saved is not None:
+            with open(state, "w") as f:
+                f.write(saved)
+
+    if not wait_until(healthy, 180, 5):
+        return False, "訓練のあと受け口が戻らない。手で見ること"
+    # 壊れた設定が捨てられていないか（原因を追えなくなるのが一番困る）
+    log = subprocess.run(道具の呼び方([cg, "--log"]),
+                         capture_output=True, text=True).stdout
+    if "戻す前の形" not in log:
+        return False, "戻したが、壊れた設定を残していない"
+    saw, detail = noticed("watchdog", mark, ["設定を動いた形に戻して復旧した"])
+    if not saw:
+        return False, "見張りが設定を戻した形跡がない"
+    return True, "設定を戻して復旧し、壊れた形も残した"
+
+
+def drill_thrash():
+    """積み直しの取り合いに、model-guard が気づくか。
+
+    本物のログも本物の ollama も触らない。**偽のログを作って読ませるだけ。**
+    2026-08-31 の朝、モデルは25分で25回積み直され、qwc はその巻き添えで
+    1手も終われなかった。それでも見張りは最後まで「正常」と書いていた。
+    ここが効かないと、同じ朝がもう一度来ても、また誰も気づかない。
+
+    3つ見る。①広さが行き来しているのを見つけるか ②同じ広さなら
+    「枠の取り合い」と言い分けるか ③静かなときに騒がないか。"""
+    tmp = tempfile.mkdtemp(prefix="drill-thrash-")
+    try:
+        def fake_log(name, widths, minutes):
+            path = os.path.join(tmp, name)
+            with open(path, "w") as f:
+                for i, m in enumerate(minutes):
+                    when = (datetime.now().astimezone() - timedelta(minutes=m))
+                    f.write(f'time={when.isoformat(timespec="milliseconds")} level=INFO '
+                            f'msg="starting llama-server" '
+                            f'cmd="llama-server --model /x -c {widths[i % len(widths)]} -np 1"\n')
+            return path
+
+        def ask(path):
+            env = {**os.environ, "OLLAMA_LOG": path}
+            r = subprocess.run(道具の呼び方([os.path.join(BIN, "model-guard"), "--report", "--dry-run"]),
+                               capture_output=True, text=True, timeout=120, env=env)
+            for line in r.stdout.splitlines():
+                if line.startswith("積み直し"):
+                    return line
+            return ""
+
+        fight = ask(fake_log("fight.log", [32768, 65536], [1, 2, 3, 4, 5, 6]))
+        if "違う広さ" not in fight:
+            return False, f"広さの取り合いを見逃した（{fight or '何も言わない'}）"
+
+        crowd = ask(fake_log("crowd.log", [65536], [1, 2, 3, 4, 5]))
+        if "枠を取り合" not in crowd:
+            return False, f"枠の取り合いと言い分けられない（{crowd or '何も言わない'}）"
+
+        quiet = ask(fake_log("quiet.log", [65536], [1, 400]))
+        if "落ち着いている" not in quiet:
+            return False, f"静かなのに騒いだ（{quiet}）"
+
+        return True, "取り合いを見つけ、種類を言い分け、静かなときは黙る"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def drill_busy():
+    """「働いているか」の見分けが裏返っていないか。
+
+    2026-08-31 に実測して分かったこと:
+
+        待機      CPU  0%     ログ 伸びない
+        前処理中  CPU  0〜1%  ログ **仕事の跡が書かれる**
+        生成中    CPU  6〜7%  ログ 断続的に書かれる
+        固まり    CPU  約4%   ログ **何も書かれない**
+
+    前処理は GPU の仕事なので CPU からは見えない。**CPU だけで見ると、
+    守るべき前処理を「暇」と読み、殺すべき固まりを「働いている」と読む**
+    ——ちょうど裏返る。実際その日、ollama が無応答になったのに見張りは
+    10分間「処理中だから見送り」と書き続けた。
+
+    さらに、ログが伸びたかを素朴に見ると、**見張り自身の `/api/tags` の
+    1行**を仕事と誤読して、また固まりを見逃す。だから `[GIN]` 行は数えない。
+
+    ここでは本物の ollama を触らない。**偽のログを読ませて**、
+    ①何も書かれなければ IDLE ②仕事の行が書かれれば BUSY
+    ③HTTPの記録だけなら IDLE（見逃しの原因になった罠）を確かめる。"""
+    # **モデルを動かしている側（llama-server）が居なければ、見分けは試せない。**
+    # model-guard の runner_busy() は居ないと即「暇」を返すので、偽の記録を読ませても
+    # IDLE になり、「動いている仕事を殺す側に倒れている」と**誤って告発していた**。
+    # 家ではモデルが常に載っているので表に出ない（2026-09-23、家の無い Mac で出た）。
+    居る = run(["pgrep", "-f", "llama-server"])
+    if not (居る and (居る.stdout or "").strip()):
+        return None, "モデルが載っていない（llama-server が居ない）ので、見分けを試せない"
+    tmp = tempfile.mkdtemp(prefix="drill-busy-")
+    try:
+        log = os.path.join(tmp, "ollama.log")
+
+        def ask(write_after=None):
+            open(log, "w").close()
+            if write_after is not None:
+                def later():
+                    time.sleep(0.5)
+                    with open(log, "a") as f:
+                        f.write(write_after + "\n")
+                threading.Thread(target=later, daemon=True).start()
+            env = {**os.environ, "OLLAMA_LOG": log}
+            r = subprocess.run(道具の呼び方([os.path.join(BIN, "model-guard"), "--busy"]),
+                               capture_output=True, text=True, timeout=120, env=env)
+            return r.stdout.strip()
+
+        # 本物のモデルが誰かに使われていると CPU 側が反応してしまう。
+        # そのときは見分けを確かめようがないので、正直に見送る。
+        for _ in range(3):
+            base = ask()
+            if base == "IDLE":
+                break
+            time.sleep(3)
+        else:
+            # **見送ったのを「通った」に数えない。**（2026-09-23）
+            # True を返していたので、使用中の日は毎回「通った」と記録され、試していない日と区別がつかなかった。
+            return None, "モデルが使用中だったので見分けを試せない（見送った）"
+
+        worked = ask("slot print_timing: id  0 | task 7 | prompt processing, n_tokens = 512")
+        if worked != "BUSY":
+            return False, f"前処理中を見分けられない（{worked}）＝動いている仕事を殺す側に倒れている"
+
+        gin = ask('[GIN] 2026/08/31 - 05:30:00 | 200 | 1.5ms | 127.0.0.1 | GET "/api/tags"')
+        if gin != "IDLE":
+            return False, f"見張り自身の通信を仕事と誤読する（{gin}）＝固まりを見逃す側に倒れている"
+
+        return True, "前処理中は守り、HTTPの記録には釣られない"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+# ── 壁の訓練（実行ランタイム側）────────────────────────────────
+#
+# ここから下は、見張りではなく **壁** を試す。
+#
+# 壁は黙って壁でなくなる。`sandbox-exec` は Apple が非推奨にしているので、
+# OS を上げた日に効かなくなっても不思議はない。そのとき**何も起きない**。
+# エラーも警報も出ず、ただ素通しになって、走っているものは全部成功する。
+# この家が何度も踏んだ壊れ方（config-guard が「戻した」と言って戻して
+# いなかった／qwc-guard が毎朝 exit127 だった）と同じ形である。
+#
+# **だから毎日、脱出を試みて失敗することを見せる。**
+# どの項目にも「通るべき側」を1つ入れてある。壁が全部を拒否するように
+# 壊れたときに、それを合格と読み違えないため（2026-09-11、一時ファイルの
+# ために /private/var/folders を丸ごと許して素通しにした穴は、
+# この形の試験で見つけた）。
+
+
+
+
+
+_証明の覚え = None
+
+
+# **「測っていない」は、通ったでも落ちたでもない третье。**
+# 訓練の返りは (ok, 説明) の2つ組なので、ok に None を返して言い分ける。
+# 走らなかった項目と同じ扱いにする——**通った数に混ぜない。**
+測れなかった = object()
+
+
+def _verify():
+    """guardrun の証明を1回走らせる。{壁: (効いたか, 説明)} か、読めなければ None。
+
+    **1回の訓練では1度しか走らせない。**証明は実測25秒で、中で本物の
+    sandbox-exec を何十回も起こす。項目ごとに呼び直していたころは
+    同じことを3回やっていた（escape 1回・limits 2回）。
+    覚えるのはプロセスの中だけなので、次の訓練では必ず走り直す。"""
+    global _証明の覚え
+    if _証明の覚え is not None:
+        return _証明の覚え
+    sys.path.insert(0, BIN)
+    try:
+        import guardrun
+    except Exception as e:
+        _証明の覚え = (None, "guardrun が読めない: %s" % e)
+        return _証明の覚え
+    try:
+        _証明の覚え = (guardrun.verify(), None)
+    except getattr(guardrun, "証明が取れない", ()) as e:
+        # **先客が居て測れなかった。落ちたとは書かない。**
+        # 2026-09-13、証明は同時に2つ走ると壁を「無い」と報告していた
+        # （作業場を共有していたため。単独 11○0★ ／ 同時は両方 ★）。
+        # 直したのは向こう（走りごとに mkdtemp ＋ 鍵・最大600秒待つ）。
+        # 待っても取れなければ、この例外が来る。
+        #
+        # **ここで ★ に倒すと、直した意味が消える。**衝突を「壁が無い」と
+        # 書くと、`require` に挙げた壁が証明できない扱いになって本物の仕事が止まる。
+        # だから「測っていない」として持ち帰る（通ったとも落ちたとも書かない）。
+        _証明の覚え = (測れなかった, "証明の鍵が取れなかった: %s" % e)
+    except Exception as e:
+        _証明の覚え = (None, "証明が走らない: %s" % e)
+    return _証明の覚え
+
+
+def _judge(壁たち, names):
+    """名指しした壁だけを見る。**説明はそのまま持ち帰る。**"""
+    res, why = 壁たち
+    if res is 測れなかった:
+        return None, why          # 測っていない。落ちたとは書かない
+    if res is None:
+        return False, why
+    bad = ["%s: %s" % (n, res[n][1]) for n in names if not res.get(n, (False, "見ていない"))[0]]
+    if bad:
+        return False, "／".join(bad)
+    return True, "／".join("%s（%s）" % (n, res[n][1]) for n in names)
+
+
+# **訓練と証明を同時に走らせないこと。**
+# 2026-09-12、手で `guardrun.py --verify` を回している最中に訓練を回したら、
+# `busy` が落ちた（「見張り自身の通信を仕事と誤読する」）。誤報ではなく、
+# 証明の通信チェックが**本物の ollama 通信を出していた**ため。
+# 定時実行は1本ずつ走るので実害は無いが、手で重ねると落ちる。
+
+
+def drill_escape():
+    """壁から抜け出せないことを確かめる。**抜け出せたら壁ではない。**
+
+    中身は guardrun.verify() に置いてある。**同じことを2か所に書かない。**
+    ここで別に書くと、片方だけ直った日に、訓練のほうが古い壁を見る。"""
+    import guardrun as _g  # noqa: F401  （読めるかはここで落ちる）
+    return _judge(_verify(), [_g.場所, _g.秘密, _g.通信])
+
+
+def drill_limits():
+    """量・CPU・時間の上限が効くことを確かめる。**孫まで始末できるかも見る。**
+
+    **「残党」は既定で求めない。**自分でプロセスグループを作って親が即死する
+    孫は、sandbox-exec では塞げない（2026-09-11 実測。killpg は届かず、
+    親が即死するので子孫としても辿れない。環境変数の印で探す案も、
+    ps が子の環境を見せないので没になった）。塞ぐには専用ユーザが要る。
+
+    **落とさないが、黙らない。**毎日落ちる訓練は読まれなくなるので合否には
+    入れないが、状態は毎回そのまま出す。塞がった日に気づけるように。"""
+    import guardrun as _g
+    ok, msg = _judge(_verify(), [_g.量, _g.総量, _g.CPU, _g.時間])
+    if ok is None:
+        return None, msg          # 測っていない。ここから先は足さない
+    res, _ = _verify()
+    if res and _g.残党 in res:
+        直った, 説明 = res[_g.残党]
+        msg += "／残党: %s（%s）" % ("塞がった" if 直った else "未証明", 説明)
+    return ok, msg
+
+
+def drill_spin():
+    """**空回りの見分けが、まだ効くか。**
+
+    2026-09-11 の8時間25分は、Discord から来た1件の依頼が
+    progress_card を139回呼び続けただけで終わった。あれは
+    2分おきに道具を呼んでいたので、**この家の見張り全員から忙しく見えていた**。
+
+    loop-guard はその形を「時間 かつ 回数」で見分ける。しきい値は記録162件に
+    当てて、事故1件だけが残ることを確かめて決めた値なので、
+    **しきい値をいじれば黙るし、記録が消えれば試せなくなる。**
+
+    ここでやるのは回帰試験。本物の記録に当てて
+      1) 事故の依頼を拾えるか
+      2) 健全な161件を拾わないか
+    の両方を見る。**片方だけだと、何でも拾う見張りでも通ってしまう。**
+
+    模擬の故障を作らないので、この訓練は何も壊さない。"""
+    # **事故は1件ではない。**loop-guard に「返りを見ない門」が入った 2026-09-13、
+    # 2件目が掘り当たった。数を決め打ちにしていたので、訓練のほうが古くなった。
+    #
+    #   7e2888e5  2026-09-11 の8時間25分（progress_card 139回）
+    #   3aab972c  同じころの LINE の事故（conversations_send を引数ごと21回続けて。
+    #             37文字の識別子を写し損ねて26回中23回失敗したあの回）
+    #
+    # **数ではなく、名指しした事故が全部拾えるかで見る。**そのうえで
+    # 「何でも拾う」側に壊れていないかを、**上限**で見る（記録の 5% まで）。
+    # 数を決め打ちにすると、新しい事故を掘り当てた日に訓練のほうが落ちる。
+    # **どの門が支えているかまで書く。**名前だけだと、別の門が緩んで
+    # 代わりに拾っているのを「効いている」と読む。2026-09-13 に実測で確かめた:
+    # 返りを見ない門を殺し、時間の門を 3分・12回 に緩めると、
+    # **2件とも拾えたまま、返りを見ない門は死んでいる。**
+    #
+    #   7e2888e5  8時間25分（progress_card 139回・2026-09-11）        時間の門
+    #   3aab972c  宛先の識別子を5文字落として、同じ引数で21回続けた
+    #             conv_…32f8e4de（37文字）→ conv_…3e4（32文字）
+    #             **呼び出しは23回・全部 conversations_send・全部 09-09**
+    #             （22回が 20:59:54〜21:01:58 の約2分に集中し、1回だけ 21:15:52。
+    #              最後の1回は**別の依頼**〈seq 843・道具2回・連続1〉なので、
+    #              **鳴らないのが正しい**。事故全体は16分でも、空回りとして
+    #              捕まえるべきなのは seq 788 の4分のほう。
+    #              **「事故の長さ」と「空回りの単位」は別物。**）
+    #                                                                 返りを見ない門
+    #
+    # **「文字列を含む行」を数えない。**最初は 09-09〜09-12 と書いていたが、
+    # それは要約や履歴に識別子が residual で残っている行（67件）の範囲で、
+    # **実際の呼び出し（23件）は 09-09 の中だけ**だった。
+    # 道具を呼んだ跡（tool_use）と、文字が写っているだけの行は別物。
+    #
+    # **覚え書きの「2026-09-11 LINE の message failed」とは別口。**
+    # あちらは `message` 道具（15回・09-08〜09-11）で、こちらは
+    # `conversations_send`（23回・09-09）。根は同じ（長い識別子を写せない）だが、
+    # 道具も日付も違う。1文に畳むと、記録から探せなくなる。
+    事故たち = {"7e2888e5": ("8時間25分（progress_card 139回）",
+                             "SPIN_MINUTES", "時間の門"),
+                "3aab972c": ("宛先の識別子を5文字落として同じ引数を21回続けた"
+                             "（conversations_send 23回・09-09）",
+                             "SAME_ARGS_STREAK", "返りを見ない門")}
+    INCIDENT = "7e2888e5"
+    tool = os.path.join(BIN, "loop-guard")
+    if not os.path.exists(tool):
+        return False, "loop-guard が無い（空回りを見る者が居ない）"
+    try:
+        p = subprocess.run([tool, "--replay"], capture_output=True,
+                           text=True, timeout=180, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return False, f"loop-guard を呼べなかった（{type(e).__name__}）"
+    out = p.stdout.strip()
+    m = re.search(r"当てた依頼\s*(\d+)\s*件.*?引っかかった\s*(\d+)\s*件", out, re.S)
+    if not m:
+        return False, f"判定の結果が読めない: {out[:160]}"
+    total, fired = int(m.group(1)), int(m.group(2))
+    if total < 50:
+        # 記録が消えると、この訓練は「通った」ではなく「試せなくなった」。
+        # **黙って通すと、試験そのものが消えたことに気づけない。**
+        return False, (f"当てられた依頼が {total} 件しかない。"
+                       f"記録が消えたので、この試験はもう証拠になっていない")
+    if fired == 0:
+        return False, (f"{total} 件に当てて1件も拾わなかった。"
+                       f"事故（{INCIDENT}）を見分けられなくなっている")
+    抜け = [f"{k}（{v[0]}）" for k, v in 事故たち.items() if k not in out]
+    if 抜け:
+        return False, (f"{fired} 件拾ったが、名指しした事故が入っていない: "
+                       + "／".join(抜け))
+    上限 = max(2, total // 20)
+    if fired > 上限:
+        return False, (f"{total} 件のうち {fired} 件を拾った（上限 {上限}）。"
+                       f"何でも拾う側に壊れている疑い")
+
+    # **見分けるだけでは足りない。空回りできない形に保たれているかも見る。**
+    #
+    # 事故の燃料は progress_card だった。always 成功して、返りが毎回
+    # 新しい（rev N+1）ので、**本体の空回り検知にも「進んでいる」と見える**。
+    # 139回呼んで返りは139種類。同一の返りの連続は最長1回で、
+    # 本体のしきい値10には原理的に届かない。だから道具ごと外してある。
+    # ここが戻されたら、見分けられても同じことがまた起きる。
+    want = {
+        "tools.updatePlan": ("false", "進捗カード（空回りの燃料）が戻っている"),
+        "tools.loopDetection.enabled": ("true", "本体の空回り検知が切れている"),
+    }
+    for path, (expect, complaint) in want.items():
+        r = run([CLAW_BIN, "config", "get", path], timeout=60)
+        got = (r.stdout.strip().splitlines()[-1].strip().lower()
+               if r and r.stdout.strip() else "")
+        if got != expect:
+            return False, f"{complaint}（{path} が {got or '未設定'}）"
+    r = run([CLAW_BIN, "config", "get", "agents.defaults.timeoutSeconds"], timeout=60)
+    try:
+        budget = int(r.stdout.strip().splitlines()[-1])
+    except (AttributeError, ValueError, IndexError):
+        return False, "実行予算が読めない（既定の48時間に戻っている疑い）"
+    if not 0 < budget <= 3600:
+        return False, (f"実行予算が {budget}秒。48時間の既定に戻ったか、"
+                       f"1時間より長い。8時間半の事故はこれが無かったから伸びた")
+
+    # **その門を殺したら、その事故が消えるか。**
+    # 拾えたことは「何かが拾った」までしか言わない。門ごとに殺して確かめる。
+    src = open(tool).read()
+    支えた = []
+    for 事故, (説明, 定数, 門名) in 事故たち.items():
+        if f"\n{定数} = " not in src:
+            return False, f"{門名}の閾値（{定数}）が loop-guard に見つからない（名前が変わった？）"
+        壊し = re.sub(rf"^{定数} = .*$", f"{定数} = 99999", src, count=1, flags=re.M)
+        d = tempfile.mkdtemp(prefix="drill-spin-")
+        try:
+            写し = os.path.join(d, "loop-guard-nogate")
+            with open(写し, "w") as f:
+                f.write(壊し)
+            os.chmod(写し, 0o755)
+            env = dict(os.environ, PYTHONPATH=BIN)   # 写しの隣に guardlib は無い
+            q = subprocess.run([sys.executable, 写し, "--replay"], capture_output=True,
+                               text=True, timeout=180, stdin=subprocess.DEVNULL, env=env)
+        except Exception as e:                       # noqa: BLE001
+            return False, f"{門名}を殺した写しを走らせられない（{type(e).__name__}）"
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        # **落ちたのを「事故が消えた」と読まない。**写しが動いたことを先に確かめる。
+        if q.returncode not in (0, 1) or "当てた依頼" not in q.stdout:
+            return False, (f"{門名}を殺した写しが走らなかった（exit {q.returncode}）。"
+                           f"消えたのではなく、試せていない: "
+                           f"{(q.stderr or q.stdout).strip().splitlines()[-1][:80] if (q.stderr or q.stdout).strip() else ''}")
+        if 事故 in q.stdout:
+            return False, (f"{門名}を殺しても {事故} を拾った。"
+                           f"別の門が代わりに拾っている＝この門が効いている証拠にならない")
+        支えた.append(門名)
+
+    # ── 記録に無い形は、合成例で見る ──
+    # **返りを見ない門でしか捕まらない形は、いまの記録に1件も無い。**
+    # memory_search がその形（debug の処理時間で返りが毎回変わる）だが、
+    # 記録には3回しか呼ばれた跡が無く、繰り返した例が無い。
+    # なので loop-guard の `--selftest`（その場で作った例に当てる）も通す。
+    # **記録が無いことを、試さない理由にしない。**
+    p2 = run([tool, "--selftest"], timeout=120)
+    if not p2 or p2.returncode != 0:
+        return False, ("合成例の自己試験が通らない: "
+                       + ((p2.stdout or p2.stderr).strip().splitlines()[-1][:90]
+                          if p2 else "走らなかった"))
+    m2 = re.search(r"合計:\s*(\d+)\s*件成功\s*/\s*(\d+)\s*件失敗", p2.stdout or "")
+    if not m2:
+        return False, "自己試験の結果が読めない（出力の形が変わった？）"
+    成功, 失敗 = int(m2.group(1)), int(m2.group(2))
+    if 失敗 or 成功 < 5:
+        return False, f"自己試験が {成功} 件成功 / {失敗} 件失敗"
+
+    return True, (f"合成例 {成功} 件・"
+                  f"記録 {total} 件に当てて事故 {len(事故たち)} 件を拾い"
+                  f"（{fired} 件・上限 {上限}）、"
+                  f"{'／'.join(支えた)}を殺すとそれぞれ消え、"
+                  f"燃料も断ってある（進捗カード無効・検知有効・予算{budget // 60}分）")
+
+
+def drill_silence():
+    """**黙って消えることが、まだ見えるか。**
+
+    ここが見えなくなっても、**誰も教えてくれない**（見えないのだから）。
+    だから毎日、使い捨ての launchd の仕事を本物の OS に登録して、
+    実際に走らせ・失敗させ・黙らせて、点呼がそれを名指しできるかを見る。
+
+    中身は silence.verify() に置いてある。**同じことを2か所に書かない。**
+
+    **「全部通った」は「全部を通すように壊れた」と見分けがつかない**ので、
+    verify() の中に「通るべき側」（健全な回を健全と読む）が入れてある。
+    そのうえでここでは、**本物の家に当てて全部が鳴っていないこと**も見る。
+    何でも鳴る見張りは、何も見ていない見張りと同じだけ役に立たない。"""
+    sys.path.insert(0, BIN)
+    try:
+        import silence
+    except Exception as e:
+        return False, "点呼が読めない: %s" % e
+    try:
+        res = silence.verify()
+    except Exception as e:
+        return False, "証明が走らない: %s: %s" % (type(e).__name__, e)
+    bad = ["%s（%s）" % (k, why) for k, (ok, why) in res.items() if not ok]
+    if bad:
+        return False, "／".join(bad)
+
+    # **本物の家に当てる。**覚えは読むだけで書かない（watchdog の時計を進めない）。
+    try:
+        所見, _ = silence.点呼()
+    except Exception as e:
+        return False, "本物に当てられない: %s" % type(e).__name__
+    鳴 = [x for x in 所見 if x["判定"] in silence.鳴る判定 and x["鍵"] != "外の証人"]
+    if len(所見) < 10:
+        return False, ("台帳に %d 本しか出ていない。launchd から生えていないか、"
+                       "読めていない" % len(所見))
+    if len(鳴) > len(所見) // 2:
+        return False, ("%d 本中 %d 本が鳴っている。家が燃えているか、"
+                       "点呼が何でも鳴る側に壊れている" % (len(所見), len(鳴)))
+    return True, ("%d 項目すべて通り、本物の %d 本に当てて %d 本だけ鳴った"
+                  % (len(res), len(所見), len(鳴)))
+
+
+def drill_walled():
+    """**qwc が壁の中を通っているか。**
+
+    この家は何でも見張っているのに、**「壁が使われているか」を見ている者が
+    居なかった**（2026-09-14）。`~/bin/qwc` は本体へのシンボリックリンクを
+    dispatcher に置き換えたものなので、`git checkout` 一発で静かに元へ戻る。
+    戻っても**受領証が増えなくなるだけ**で、警報は鳴らない。
+
+    壁そのものは escape / limits / silent が毎日試している。
+    ここで見るのは**使われているか**のほう。効く壁を誰も通らないなら、
+    それは壁が無いのと同じである。
+
+    見るのは3つ：
+      形    `qwc` が guardrun を通す作りになっているか
+      跡    壁を通った本物の走りが、直近に受領証を残しているか
+      逃げ道 `--壁なし` が生きているか（塞がると人は壁ごと捨てる）
+    **跡はモデルを呼ばずに見る**——qwc-guard が毎日1回、壁の中で qwc を
+    走らせているので、その受領証を読めばよい。訓練で二度手間をしない。"""
+    import json
+    import glob
+    悪い = []
+
+    # ① 形
+    道 = os.path.join(BIN, "qwc")
+    if os.path.islink(道):
+        悪い.append("qwc が本体への直リンクに戻っている（壁を通らない）")
+    else:
+        try:
+            中身 = open(道, encoding="utf-8").read()
+        except OSError as e:
+            中身 = ""
+            悪い.append("qwc が読めない（%s）" % type(e).__name__)
+        if 中身 and "guardrun" not in 中身:
+            悪い.append("qwc が guardrun を通していない")
+        if 中身 and "--壁なし" not in 中身:
+            悪い.append("逃げ道（--壁なし）が無い＝壁ごと捨てられる形")
+
+    # ② 跡（qwc-guard の走りの受領証。モデルは呼ばない）
+    sys.path.insert(0, BIN)
+    try:
+        import guardrun as g
+        置き場 = os.path.join(g.記録の根(), "runs", "*", "受領証.json")
+    except Exception as e:
+        置き場 = None
+        悪い.append("guardrun が読めない（%s）" % type(e).__name__)
+    新しい = None
+    if 置き場:
+        for p in sorted(glob.glob(置き場))[-60:]:
+            try:
+                r = json.load(open(p))
+            except Exception:
+                continue
+            if "qwc-guard-" not in (r.get("作業場") or ""):
+                continue
+            if time.time() - os.path.getmtime(p) > 48 * 3600:
+                continue
+            新しい = r
+        if 新しい is None:
+            悪い.append("48時間のうちに、壁を通った qwc の走りが1件も無い")
+        elif "素通し" in (新しい.get("執行") or ""):
+            悪い.append("走ってはいるが囲われていない（執行: %s）" % 新しい["執行"])
+
+    # ③ 逃げ道が生きているか（**通るべき側**。塞がっていたら人は壁を捨てる）
+    try:
+        p = subprocess.run([道, "--壁なし", "--version"], capture_output=True,
+                           text=True, timeout=60)
+        if p.returncode != 0 or "qwc" not in (p.stdout or ""):
+            悪い.append("--壁なし が動かない（%s）"
+                        % ((p.stdout or p.stderr or "").strip()[:40]))
+    except Exception as e:
+        悪い.append("--壁なし を試せない（%s）" % type(e).__name__)
+
+    if 悪い:
+        return False, "／".join(悪い)
+    執行 = (新しい or {}).get("執行", "?")
+    return True, ("qwc は壁を通す作り・逃げ道も生きている"
+                  "（直近の走りの執行: %s）" % 執行)
+
+
+def drill_silent():
+    """**黙って終われないことを確かめる。**
+
+    この家のものは落ちずに黙る。いちばん純粋な形は「走ったのに、走った
+    という記録だけが無い」で、2026-09-12 に実測したときは
+    親を SIGKILL しただけで
+      仕事は起きた（作業場にファイルが残る）／受領証は無い／子孫は生き残る
+    となり、**そのあと誰にも何も分からなかった。**
+
+    塞ぎ方は、走り出す前に「まだ終わっていない」と書いておくこと。
+    無いものは探せないので、**先に在ると約束しておく**しかない。
+
+    ここで見るのは2つ：
+      記録  受領証の置き場に、採点される側（壁の中）の手が届かないこと
+      黙り  殺された走りが中断として受領証になり、残党も始末されること
+    どちらも「通るべき側」つき。掃除が全部を中断と呼ぶように壊れたら、
+    **生きている仕事を殺しに行く**ので、そちらも同じ重さで見る。
+
+    最後に**この家の配線**も見る。証明が通っても、5分おきに読む者が
+    居なければ黙りは残る（記録だけ増えて誰も読まない、はこの家の実績）。"""
+    import guardrun as _g
+    ok, msg = _judge(_verify(), [_g.記録, _g.黙り])
+    if ok is None:
+        return None, msg          # 測っていない。ここから先は足さない
+    印 = []
+    import schedlib
+    登録 = schedlib.PID一覧()
+    if "ai.openclaw.guardrun-sweep" not in 登録:
+        ok = False
+        印.append("掃除が launchd に登録されていない（誰も予告を読まない）")
+    心拍 = os.path.expanduser("~/.openclaw/pulse/guardrun-sweep.json")
+    if not os.path.exists(心拍):
+        ok = False
+        印.append("掃除の心拍が無い（一度も走り切っていない）")
+    else:
+        古さ = time.time() - os.path.getmtime(心拍)
+        # **新しさは点呼の担当。**ここは「丸一日以上ない」だけを見る。
+        # 重ねて見ると、寝起きの朝に2人が同じことを鳴らす。
+        if 古さ > 86400:
+            ok = False
+            印.append("掃除が %.0f 時間走っていない" % (古さ / 3600))
+        else:
+            印.append("掃除は %.0f 分前に走った" % (古さ / 60))
+    return ok, msg + ("／" + "／".join(印) if 印 else "")
+
+
+def drill_keep():
+    """**守りの設定が消えた形を、「動いた形」として焼き付けないか。**
+
+    2026-09-12 23:10、`config-guard` は `tools.updatePlan` `tools.loopDetection.enabled`
+    `agents.defaults.timeoutSeconds` の**3つが消えた設定を「動いた形」として保存した**。
+    翌 00:00 に同じ形を再確認し、**05:30 の訓練が落ちるまで7時間**誰も気づかなかった。
+    gateway は ok を返し続けていたので、`healthy()` では見えない。
+
+    **「動いた形」は戻る先である。**欠けた形が戻る先になると、
+    次にここへ戻すたびに守りが外れる。壊れ方が保存される。
+
+    ここで見るのは3つ。
+      対照  いまの実物は通る（何でも断る側に壊れていない）
+      壊し  守りを1つずつ欠くと、**それぞれを名指しで**断る
+      配線  `cmd_save` が実際にこの判定を通っている（判定があっても、
+            呼ばれていなければ効かない——この家で何度も踏んだ形）
+
+    本物の設定は1バイトも触らない。写しを壊して判定に当てるだけ。"""
+    import copy
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(BIN, "config-guard")
+    if not os.path.exists(path):
+        return False, "config-guard が無い"
+    try:
+        spec = importlib.util.spec_from_loader(
+            "cg_drill", importlib.machinery.SourceFileLoader("cg_drill", path))
+        cg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cg)
+    except Exception as e:                               # noqa: BLE001
+        return False, f"config-guard を読み込めない（{type(e).__name__}: {e}）"
+    if not hasattr(cg, "守りを確かめる"):
+        return False, "config-guard に守りの確認が無い（「動いた形」が素通しで保存される）"
+
+    # 対照。ここが赤いなら、本物の設定のほうが欠けている。
+    ok, 欠け = cg.守りを確かめる()
+    if not ok:
+        return False, "いまの設定に守りが欠けている: " + "／".join(x.split("（")[0] for x in 欠け)
+
+    try:
+        with open(os.path.join(OPENCLAW, "openclaw.json")) as f:
+            live = json.load(f)
+    except (OSError, ValueError) as e:
+        return False, f"設定を読めない（{type(e).__name__}）"
+
+    # **戻ってはいけない値。**閾値をここに写さない——写すと2か所が別々にずれる。
+    # 置くのは**事故のときに実際に入っていた値**で、これは history の事実なので動かない。
+    #
+    # これが要る理由は、この訓練自身の壊し試験で分かった（2026-09-13）。
+    # 「消したら断るか」だけを見ていると、**期待の側を緩められても通ってしまう**。
+    # 実際、予算の上限を 3600 → 999999 に広げたら、訓練は素通しで通った。
+    # 消えたときしか試していなかったので、**守りが生きているふりができた。**
+    戻ってはいけない値 = {
+        "tools.updatePlan": True,                  # 進捗カードが有効だった形
+        "tools.loopDetection.enabled": False,      # 本体の検知が切れた形
+        "agents.defaults.timeoutSeconds": 172800,  # 48時間＝既定。事故が8時間半まで伸びた
+        "tools.deny": [],                          # 写す道具が戻った形（09-09 の23回失敗）
+    }
+
+    def _差し替え(道筋, 値=None, 消す=False):
+        写し = copy.deepcopy(live)
+        親, 枝 = 写し, 道筋.split(".")
+        for k in 枝[:-1]:
+            親 = 親.setdefault(k, {})
+        if 消す:
+            親.pop(枝[-1], None)
+        else:
+            親[枝[-1]] = 値
+        return 写し
+
+    # 壊し その1。1つずつ消して、その1つを名指しできるか。
+    見つけた = 0
+    for 道筋, _期待, _why in cg.守りの設定:
+        通った, 訴え = cg.守りを確かめる(_差し替え(道筋, 消す=True))
+        if 通った:
+            return False, f"{道筋} を消しても通した（守りが1つ抜けても保存される）"
+        if not any(x.startswith(道筋) for x in 訴え):
+            return False, f"{道筋} を消したのに、別のものを訴えた: {訴え[:1]}"
+        見つけた += 1
+
+    # 壊し その2。事故の値そのものを入れて、断るか。
+    弾いた = 0
+    for 道筋, 値 in 戻ってはいけない値.items():
+        if all(道筋 != p for p, _e, _w in cg.守りの設定):
+            return False, f"{道筋} が守りの一覧から外されている（事故の値が素通りする）"
+        通った, 訴え = cg.守りを確かめる(_差し替え(道筋, 値))
+        if 通った:
+            return False, (f"{道筋} に {値} を入れても通した"
+                           f"（事故のときの形が「動いた形」になる）")
+        if not any(x.startswith(道筋) for x in 訴え):
+            return False, f"{道筋} に {値} を入れたのに、別のものを訴えた: {訴え[:1]}"
+        弾いた += 1
+
+    # 配線。判定を書いただけで呼んでいない、を防ぐ。
+    try:
+        src = open(path).read()
+    except OSError:
+        return False, "config-guard を読めない"
+    本体 = src.split("def cmd_save", 1)[-1].split("\ndef ", 1)[0]
+    if "守りを確かめる" not in 本体:
+        return False, "cmd_save が守りの確認を呼んでいない（判定はあるが効かない）"
+
+    return True, (f"守り {見つけた} 件を欠いても、事故の値 {弾いた} 件を入れても"
+                  f"名指しで断った（いまの実物は通る・cmd_save から呼ばれている）")
+
+
+def drill_rewrite():
+    """**戻したそばから書き直される、を見抜けるか。**
+
+    2026-09-06 の本物の壊れ方はこれだった。`config-guard --rollback` が
+    「動いた形に戻しました」と表示しながら、**ファイルを1バイトも変えていなかった**。
+    起動に失敗する gateway が、死ぬ前に設定を自分の形へ書き直すためで、
+    **書き込みから約2秒**で起きる。`git checkout` の終了コードは 0 を返すので、
+    そこだけ見ていると永久に気づけない。
+
+    **`config` の訓練ではこの形を再現できない。**あちらは壊れた JSON を書くが、
+    壊れた JSON は gateway が読めないので、書き直すこともできない。
+    だから訓練では戻しが必ず効く。**毎日通っていた訓練は、ここが動く証拠に
+    なっていなかった。**（「まだ直っていないこと」に長く残っていた項目。）
+
+    ここでは gateway を使わずに、**上書きする者**を自分で用意して当てる。
+
+        通るべき側    誰も書き直さなければ「残った」と答える
+        1回目で捕まる  そもそも書けていない（別の中身）ときに気づく
+        2回目で捕まる  **書いた直後は正しく、数秒後に書き直される**
+                      ——1回しか読まない実装は、ここだけを必ず見逃す
+        配線          cmd_rollback が実際にこの判定を通っている
+
+    本物の設定は触らない。写しの上で、上書きする者を走らせるだけ。"""
+    import importlib.machinery
+    import importlib.util
+    import threading
+    path = os.path.join(BIN, "config-guard")
+    if not os.path.exists(path):
+        return False, "config-guard が無い"
+    try:
+        spec = importlib.util.spec_from_loader(
+            "cg_rw", importlib.machinery.SourceFileLoader("cg_rw", path))
+        cg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cg)
+    except Exception as e:                               # noqa: BLE001
+        return False, f"config-guard を読み込めない（{type(e).__name__}: {e}）"
+    if not hasattr(cg, "landed"):
+        return False, "config-guard に「書けたか」の確認が無い"
+    if getattr(cg, "SETTLE", 0) < 4:
+        return False, f"待ち時間が {getattr(cg, 'SETTLE', 0)}秒（実測2秒の書き直しを取りこぼす）"
+
+    tmp = tempfile.mkdtemp(prefix="drill-rewrite-")
+    元の場所 = cg.CONFIG
+    cg.CONFIG = os.path.join(tmp, "openclaw.json")
+    正, 誤 = '{"a": 1}\n', '{"a": 2}\n'
+    止める = threading.Event()
+
+    def 書き直す(after):
+        """gateway の代わり。指定秒後に1回だけ書き直す。"""
+        if 止める.wait(after):
+            return
+        try:
+            with open(cg.CONFIG, "w") as f:
+                f.write(誤)
+        except OSError:
+            pass
+
+    try:
+        with open(cg.CONFIG, "w") as f:
+            f.write(正)
+        ok, why = cg.landed(正)
+        if not ok:
+            return False, f"誰も書き直していないのに「残っていない」と答えた（{why}）"
+
+        with open(cg.CONFIG, "w") as f:
+            f.write(誤)
+        ok, why = cg.landed(正)
+        if ok:
+            return False, "別の中身なのに「残った」と答えた（1回目の確認が効いていない）"
+        一 = why
+
+        with open(cg.CONFIG, "w") as f:
+            f.write(正)
+        t = threading.Thread(target=書き直す, args=(1.5,), daemon=True)
+        t.start()
+        ok, why = cg.landed(正)
+        止める.set()
+        t.join(timeout=5)
+        if ok:
+            return False, ("書いた直後は正しく、1.5秒後に書き直されたのに「残った」と答えた"
+                           "——1回しか読んでいない（2026-09-06 の壊れ方そのもの）")
+        if why == 一:
+            return False, f"1回目と2回目を言い分けていない（どちらも「{why}」）"
+        二 = why
+    finally:
+        止める.set()
+        cg.CONFIG = 元の場所
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    try:
+        src = open(path).read()
+    except OSError:
+        return False, "config-guard を読めない"
+    本体 = src.split("def cmd_rollback", 1)[-1].split("\ndef ", 1)[0]
+    if "landed(" not in 本体:
+        return False, "cmd_rollback が「書けたか」を確かめていない（判定はあるが効かない）"
+
+    return True, (f"書き直されない回は通し、別の中身は「{一}」、"
+                  f"{cg.SETTLE}秒のあいだの書き直しは「{二}」と言い分けた"
+                  f"（cmd_rollback から呼ばれている）")
+
+
+def drill_beacon():
+    """**外の証人が、居ると言えるか。**
+
+    機械ごと落ちたときは中の誰も気づけない。外に印を置き（`beacon`）、
+    外の定時（claude.ai の routine・1時間ごと）がその古さを見る。
+
+    ここで見るのは3つ。**外が生きているかは見ない**——見られるなら、
+    それは外の証人ではない。
+
+        出る量   外に出るのは決めた3つ（at・点呼・鳴っている）だけか
+        押す口   launchd に登録されていて、押せているか
+        正直さ   「外から読めることを見せた記録」が無いときに、
+                 点呼が「生きている」と言わないか
+
+    **出る量をここで見るのがいちばん大事。**この家の芯は逃げ道が無いこと
+    なので、外に出す量は数えられるほど少なく保つ。項目を足した日にここが落ちる。"""
+    b = os.path.join(BIN, "beacon")
+    if not os.path.exists(b):
+        return False, "beacon が無い（外に押す者が居ない）"
+
+    # ── 出る量。押さずに、出る中身だけ見る ──
+    p = run([b, "--dry-run"], timeout=60)
+    if not p or p.returncode != 0:
+        return False, "beacon --dry-run が動かない"
+    try:
+        出る = json.loads(p.stdout.strip())
+    except ValueError:
+        return False, "外に出る中身が JSON として読めない: %s" % p.stdout[:80]
+    決めた = {"at", "点呼", "鳴っている"}
+    余計, 欠け = set(出る) - 決めた, 決めた - set(出る)
+    if 余計:
+        return False, ("決めていないものが外に出ている: %s"
+                       "（外に出す量は数えられるほど少なく保つ）" % sorted(余計))
+    if 欠け:
+        return False, "外に出るはずのものが欠けている: %s" % sorted(欠け)
+
+    # ── 押す口 ──
+    import schedlib
+    if "ai.openclaw.beacon" not in schedlib.PID一覧():
+        return False, "beacon が定時に登録されていない（誰も押さない）"
+    if not os.path.exists(os.path.join(PULSE_DIR, "beacon.json")):
+        return False, "beacon が一度も走り切っていない"
+
+    # ── 正直さ。点呼の判定だけを、写しの入力に当てる ──
+    sys.path.insert(0, BIN)
+    try:
+        import silence
+    except Exception as e:                               # noqa: BLE001
+        return False, "点呼が読めない（%s）" % type(e).__name__
+    いま = time.time()
+    普通 = silence._外の証人(いま, lambda n: いま - 60, 押せた=いま - 60)
+    止まり = silence._外の証人(いま, lambda n: いま - 60, 押せた=いま - 86400)
+    未証明 = silence._外の証人(いま, lambda n: いま - 60, 押せた=いま - 60, 確かめた="")
+    古い = silence._外の証人(いま, lambda n: いま - 60, 押せた=いま - 60,
+                            確かめた="2020-01-01")
+    押せていない = silence._外の証人(いま, lambda n: いま - 60, 押せた=0)
+    if 古い["判定"] == silence.生:
+        return False, "外から読めることを見せたのが6年前なのに「生きている」と読んだ"
+    # **心拍が新しくても、押せていなければ黙り。**
+    # 2026-09-14、外の印が1時間39分止まっているのに「押せている」と言った。
+    # 心拍は Guard.run が必ず書くので、**押せなくても新しくなる**。
+    # しかも beacon --show で確かめるたびに心拍が更新され、確かめる行為が古さを隠した。
+    if 押せていない["判定"] != silence.黙:
+        return False, ("一度も押せていないのに「%s」と読んだ"
+                       "（心拍を結果として読んでいる）" % 押せていない["判定"])
+    if 止まり["判定"] != silence.黙:
+        return False, ("心拍は新しいが1日押せていないのに「%s」と読んだ"
+                       % 止まり["判定"])
+    if 普通["判定"] != silence.生:
+        return False, "押せていて記録もあるのに「%s」と読んだ" % 普通["判定"]
+    if 未証明["判定"] == silence.生:
+        return False, ("外から読めることを見せていないのに「生きている」と読んだ"
+                       "（証明していない壁を、有ることにしている）")
+    return True, ("外に出るのは決めた3つだけ・launchd から押せている・"
+                  "見せた記録が無ければ「%s」と言う" % 未証明["判定"])
+
+
+def drill_heal():
+    """**直す者が、人の手を消さないか。**
+
+    2026-09-13、`self-heal` が人の作業を3つ消した。直す前に作業ツリーごと
+    控えを作り、訓練が落ちたら `reset --hard` で戻す作りだったので、
+    **控えを取ってから戻すまでの数分に編集したぶんが、まとめて消える**。
+    消えたこと自体は誰にも見えなかった（`house-brief` は plist が
+    `--notify` を渡したまま引数が無い状態で走り続けた＝走るが何も知らせない）。
+
+    使い捨ての git で、戻しの判断だけを当てる。
+
+        通るべき側  qwc が触ったものだけなら、ちゃんと戻す
+        壊し        人の手が増えていたら、戻さずに人に投げる
+
+    **片方だけでは足りない。**何も戻さない実装でも「消さなかった」は通る。"""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(BIN, "self-heal")
+    if not os.path.exists(path):
+        return False, "self-heal が無い"
+    try:
+        spec = importlib.util.spec_from_loader(
+            "sh_drill", importlib.machinery.SourceFileLoader("sh_drill", path))
+        sh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sh)
+    except Exception as e:                               # noqa: BLE001
+        return False, "self-heal を読み込めない（%s: %s）" % (type(e).__name__, e)
+    if not hasattr(sh, "戻す"):
+        return False, "self-heal に戻しの確認が無い（人の手ごと消す作りのまま）"
+
+    tmp = tempfile.mkdtemp(prefix="drill-heal-")
+
+    def g(*a):
+        return subprocess.run(["git", "-C", tmp, *a], capture_output=True, text=True)
+
+    def 書く(名, 中身):
+        with open(os.path.join(tmp, 名), "w") as f:
+            f.write(中身)
+
+    try:
+        g("init", "-q", ".")
+        書く("f1", "もと")
+        g("add", "-A")
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+        base = g("rev-parse", "HEAD").stdout.strip()
+        sh.git = lambda *a, **k: g(*a)
+
+        書く("f1", "qwc が直した")
+        戻せた, _ = sh.戻す(base, {"f1"}, "訓練")
+        if not 戻せた:
+            return False, "qwc が触ったものだけなのに、戻さなかった（何も直せなくなる）"
+        if open(os.path.join(tmp, "f1")).read() != "もと":
+            return False, "「戻した」と言ったのに中身が戻っていない"
+
+        書く("f1", "qwc が直した")
+        書く("f2", "人の書きかけ")
+        戻せた, 言い分 = sh.戻す(base, {"f1"}, "訓練")
+        if 戻せた:
+            return False, "人の書きかけが増えていたのに戻した（手を消す）"
+        if not os.path.exists(os.path.join(tmp, "f2")):
+            return False, "戻さないと言いながら、人の書きかけを消した"
+        if "f2" not in 言い分:
+            return False, "何が増えたのかを言っていない: %s" % 言い分[:60]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    src = open(path).read()
+    本体 = src.split("def heal", 1)[-1].split("\ndef ", 1)[0]
+    if "戻す(" not in 本体 or "変更されている道()" not in 本体:
+        return False, "heal が戻しの確認を通っていない（判定はあるが効かない）"
+    return True, "qwc のぶんだけなら戻し、人の書きかけが増えていたら戻さずに投げた"
+
+
+def drill_budget():
+    """**外へ出た知らせは取り消せない。**だから出る量に予算があるか。
+
+    プロセスを巻き戻しても、届いた通知は消えない。**副作用だけがロールバックできない。**
+    2026-09-13、点呼の誤報で1日262回知らせを出した（平常時にログへ出る通知は
+    1日4〜12件）。知らせが多すぎると読まれなくなるので、**黙るのと同じ害**になる。
+
+    見るのは5つ。**「止める」だけでは足りない**——止めたことが見えなければ、
+    予算そのものが黙らせる装置になる。
+
+        通るべき側  予算の内なら、素通しで出る
+        止まる      予算を超えたら出ない
+        黙らせない  抑えたぶんが、各見張りの記録に1行ずつ残る
+        知らせる    上限に達したことを **1回だけ** 外へ出す
+        次の窓      抑えた件数を、窓が変わったときに伝える
+
+    本物は1通も送らない（送る口を差し替えて数えるだけ）。置き場も使い捨て。"""
+    import importlib
+    sys.path.insert(0, BIN)
+    try:
+        import guardlib as GL
+        GL = importlib.reload(GL)
+    except Exception as e:                               # noqa: BLE001
+        return False, "guardlib を読み込めない（%s）" % type(e).__name__
+    if not hasattr(GL, "送信の予算"):
+        return False, "guardlib に送信の予算が無い（外へ出る量に上限がない）"
+
+    # **期待値を、試験する相手から借りない。**
+    # 最初は「予算 + 5 回呼んで、予算ぶん出るか」だけを見ていた。
+    # それだと `送信の予算 = 99999` に書き換えても訓練は通る——
+    # **訓練がその 99999 を正しい値として使う**からである（実測で確認）。
+    # だから幅は、こちらが実測から持つ。
+    #
+    #   下限 5   平常時にログへ出る通知は1日4〜12件。本物の事故を止めないため
+    #   上限 60  暴走の実測は1時間63件（2026-09-12 22時）。ここを越えると止まらない
+    予算 = GL.送信の予算
+    if not 5 <= 予算 <= 60:
+        return False, ("1時間の上限が %d 通。平常時は1日4〜12件、暴走の実測は"
+                       "1時間63件なので、5〜60 の外だと**止めないか、事故を止める**"
+                       % 予算)
+
+    元 = (GL.BUDGET_FILE, GL.LOG_DIR, GL.DRILL_MARK, GL.env_value)
+    tmp = tempfile.mkdtemp(prefix="drill-budget-")
+    try:
+        GL.BUDGET_FILE = os.path.join(tmp, "budget.json")
+        GL.LOG_DIR = os.path.join(tmp, "logs")
+        GL.DRILL_MARK = os.path.join(tmp, "印は置かない")
+        GL.env_value = lambda k: "dummy"
+        os.makedirs(GL.LOG_DIR, exist_ok=True)
+        g = GL.Guard("予算の試験")
+        g.log_path = os.path.join(GL.LOG_DIR, "予算の試験.log")
+        出た = []
+        g._post = lambda tok, ch, text: (出た.append(text), True)[1]
+        g._flush_pending = lambda tok, ch: 0
+
+        # **数えるものを、前置きで見分けられるようにする。**
+        # 最初は本文を「知らせ N」にしていたが、上限を伝える文も
+        # 「知らせが1時間で…」で始まるので、**本物に数えてしまった**。
+        # 数える対象が前置きで決まるなら、前置きを重ねないこと。
+        印 = "〈試験〉"
+        for i in range(予算 + 5):
+            g.notify("%s%d 通目" % (印, i + 1))
+        本物 = [t for t in 出た if t.startswith(印)]
+        予告 = [t for t in 出た if "超えました" in t]
+        if len(本物) != 予算:
+            return False, "%d 回呼んで %d 通出た（予算 %d のはず）" % (予算 + 5, len(本物), 予算)
+        if len(予告) != 1:
+            return False, ("上限に達した知らせが %d 通（1通だけが正しい）。"
+                           "0 なら抑えたこと自体が黙る、2以上なら騒音" % len(予告))
+        try:
+            b = json.load(open(GL.BUDGET_FILE))
+        except (OSError, ValueError):
+            return False, "予算の記録が読めない"
+        if b.get("抑えた") != 5:
+            return False, "抑えた本数が %s（5 のはず）" % b.get("抑えた")
+        try:
+            記録 = open(g.log_path).read()
+        except OSError:
+            return False, "抑えたぶんの記録が1行も書かれていない（**黙って捨てている**）"
+        残り = 記録.count("予算を超えたので送らなかった")
+        if 残り != 5:
+            return False, ("抑えたぶんの記録が %d 行（5 行のはず）。"
+                           "**黙って捨てている**" % 残り)
+
+        # 窓が変わったら、抑えた件数を伝えるか
+        b["窓"] = time.time() - GL.送信の窓 - 1
+        with open(GL.BUDGET_FILE, "w") as f:
+            json.dump(b, f)
+        出た.clear()
+        g.notify(印 + "次の窓の1通目")
+        伝えた = [t for t in 出た if "前の1時間で" in t and "5 件" in t]
+        if not 伝えた:
+            return False, ("窓が変わっても、抑えた 5 件を伝えなかった"
+                           "（抑えたことが黙りになる）")
+        if not any(t.startswith(印) for t in 出た):
+            return False, "窓が変わったのに、次の1通目が出なかった"
+    finally:
+        GL.BUDGET_FILE, GL.LOG_DIR, GL.DRILL_MARK, GL.env_value = 元
+        shutil.rmtree(tmp, ignore_errors=True)
+        importlib.reload(GL)
+
+    # 配線。予算があっても、notify が通っていなければ効かない。
+    try:
+        src = open(os.path.join(BIN, "guardlib.py")).read()
+    except OSError:
+        return False, "guardlib.py を読めない"
+    本体 = src.split("def notify", 1)[-1].split("\n    def ", 1)[0]
+    if "_予算" not in 本体:
+        return False, "notify が予算を見ていない（上限はあるが効かない）"
+
+    return True, ("予算 %d 通で止まり、超えたぶん 5 件は記録に残り、"
+                  "上限は1回だけ知らせ、窓が変わったら件数を伝えた"
+                  "（本物は1通も送っていない）" % GL.送信の予算)
+
+
+def drill_miscopy():
+    """**長い識別子の写し損ねを、まだ見分けられるか。**
+
+    gemma4:26b は37文字のランダム識別子を**確率的に**写し損ねる。
+    2026-09-09、`conv_…32f8e4de` を5文字落として **26回中23回失敗**した。
+    ところが2日後には同じ識別子を1文字も落とさずに写している。
+    **たまに通るものは、指示でも再試行でも潰れない。**
+
+    だから二段構えにしてある。
+
+        防ぐ    写す必要のある道具を外す（`tools.deny` に conversations_send）
+        見つける 返りに出た識別子を「実在」とし、引数がそれに近いが違えば写し損ね
+
+    ここで見るのは4つ。
+
+        対照     まるで別物・同一のものは拾わない
+        見つける 本物の記録23件（2026-09-09）を拾う
+        記録     記録が消えたら「試せなくなった」と言う（黙って通さない）
+        配線     house-brief が実際にこの判定を呼び、道具も外れている
+
+    **「実在」は返りからしか取らない。**返りは道具が書くので、モデルには書けない。
+    引数だけを見ると、間違った識別子を正しいものとして覚えてしまう。"""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(BIN, "house-brief")
+    if not os.path.exists(path):
+        return False, "house-brief が無い"
+    try:
+        spec = importlib.util.spec_from_loader(
+            "hb_drill", importlib.machinery.SourceFileLoader("hb_drill", path))
+        hb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hb)
+    except Exception as e:                               # noqa: BLE001
+        return False, "house-brief を読み込めない（%s: %s）" % (type(e).__name__, e)
+    if not hasattr(hb, "写し損ね"):
+        return False, "house-brief に写し損ねの判定が無い"
+
+    正 = "conv_d62e2cc87ce556ea657d2fae32f8e4de"
+    誤 = "conv_d62e2cc87ce556ea657d2fae3e4"
+    別 = "conv_591513b587b397947dc932dc1ba83421"
+    if not hb._近い(誤, 正):
+        return False, "5文字落とした識別子を、写し損ねと読まなかった"
+    if hb._近い(別, 正):
+        return False, "まるで別の識別子を写し損ねと読んだ（誤爆する）"
+    if hb._近い(正, 正):
+        return False, "同一の識別子を写し損ねと読んだ（正しく写しても鳴る）"
+
+    なぜ = _事故時点の写しへ向ける(hb)
+    if なぜ:
+        return False, なぜ
+    出 = hb.写し損ね(24 * 10)
+    if not 出:
+        # **記録が消えたら「通った」ではなく「試せなくなった」。**
+        return False, ("事故時点の記録の写し（10日）に写し損ねが1件も無い。"
+                       "2026-09-09 の23件が記録から消えたなら、"
+                       "この試験はもう証拠になっていない")
+    if len(出) != 23:
+        return False, ("事故時点の記録の写し（10日）で %d 件拾った（2026-09-09 の23件のはず）。"
+                       "記録が動いたか、見分け方が変わっている" % len(出))
+    名, 使, 元, 落 = 出[0]
+    if 使 != 誤 or 元 != 正 or 落 != 5:
+        return False, "拾ったものが違う: %s ← %s（%s文字）" % (使, 元, 落)
+
+    # 配線その1: house-brief が呼んでいるか
+    try:
+        src = open(path).read()
+    except OSError:
+        return False, "house-brief を読めない"
+    本体 = src.split("def collect", 1)[-1].split("\ndef ", 1)[0]
+    if "写し損ね(" not in 本体:
+        return False, "house-brief が写し損ねを見ていない（判定はあるが効かない）"
+
+    # 配線その2: 写す必要のある道具が外れているか
+    r = run([CLAW_BIN, "config", "get", "tools.deny"], timeout=60)
+    出力 = (r.stdout or "") if r else ""
+    if "conversations_send" not in 出力:
+        return False, ("conversations_send が tools.deny から外れている。"
+                       "**写す作業が戻っている**（写し損ねは指示では潰れない）")
+
+    return True, ("事故時点の記録の写しで 2026-09-09 の23件を拾い（5文字脱落・元の識別子まで一致）、"
+                  "別物と同一は拾わず、house-brief から呼ばれ、"
+                  "写す道具も tools.deny で外れている")
+
+
+CLAIM_FIXTURE = os.path.expanduser("~/.openclaw/drill-fixtures/claim-20260914.sqlite")
+CLAIM_FIXTURE_SHA256 = "93e70560ac62883d99a792498d9bac068bf941448750dd7417f161a9fc7777bf"
+# 最後に本番の記録で通った訓練の時刻。写しはこの時刻までの行だけを持つ。
+CLAIM_FIXTURE_AT = __import__("datetime").datetime(2026, 9, 14, 22, 35, 37)
+
+
+def _事故時点の写しへ向ける(hb):
+    """house-brief が読む記録と時計を、事故の時点で切り出した写しへ向ける。駄目なら理由を返す。
+
+    **本番の記録ではなく、事故の時点の写しに当てる。**（2026-09-23）
+    本番の記録は毎日書き足される。9/15 01:04 に同じ会話へ失敗した exec が2件足され、
+    検出器は正しく 8 回と数えたのに、claim は「6 回のはず」で8日間毎朝落ちていた。
+    窓（claim 30日・miscopy 10日）も、日が経てば事故そのものを窓の外へ押し出す
+    （miscopy はこれで 9/20 から毎回落ちていた）。
+    写しは読み取り専用で、指紋が変わったら使わない（黙って別物に当てないため）。"""
+    import hashlib
+    try:
+        with open(CLAIM_FIXTURE, "rb") as f:
+            指紋 = hashlib.sha256(f.read()).hexdigest()
+    except OSError as e:
+        return "事故時点の記録の写しが無い（%s）: %s" % (type(e).__name__, CLAIM_FIXTURE)
+    if 指紋 != CLAIM_FIXTURE_SHA256:
+        return "事故時点の記録の写しが変わっている（指紋 %s…）" % 指紋[:12]
+
+    class 写しの時刻(hb.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return CLAIM_FIXTURE_AT
+    hb.AGENT_DB = CLAIM_FIXTURE
+    hb.datetime = 写しの時刻
+    return None
+
+
+def drill_claim():
+    """**前提が違うまま回るのと、やっていないのに言うのを、まだ見分けられるか。**
+
+    どちらも「心拍は元気・プロセスは生きている・道具は返っている」ので、
+    **見張りを何本足しても見えない**。見えるのは記録に当てたときだけ。
+
+        ② 失敗の繰り返し     同じ道具が続けて失敗しているのに、やめない
+        ③ やっていないのに言う 最後の道具が失敗しているのに、完了を語る
+
+    閾値は実測の分布で決めた（会話57件・道具を使ったもの）。
+
+        連続失敗  0回 …46件 / 1回 …7件 / 2回 …1件 / 4回 …1件 / 6回 …1件 / 22回 …1件
+
+    4以上の3件はすべて本物だった。**3以下は1件も事故ではない。**
+
+    ③ は**中身を解釈しない**。「何をやったと言っているか」を読もうとすると
+    判定にモデルが要る。この家は見張りに判断を入れないので、
+    **「直前の道具が失敗しているか」という事実だけ**で見る。会話111件で1件だけ拾った。"""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(BIN, "house-brief")
+    if not os.path.exists(path):
+        return False, "house-brief が無い"
+    try:
+        spec = importlib.util.spec_from_loader(
+            "hb_claim", importlib.machinery.SourceFileLoader("hb_claim", path))
+        hb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hb)
+    except Exception as e:                               # noqa: BLE001
+        return False, "house-brief を読み込めない（%s: %s）" % (type(e).__name__, e)
+    for 名 in ("失敗の繰り返し", "やっていないのに言う", "連続失敗の上限", "完了語"):
+        if not hasattr(hb, 名):
+            return False, "house-brief に %s が無い" % 名
+
+    # 閾値が実測の外に出ていないか。**相手から借りずに、こちらが幅を持つ。**
+    if not 3 <= hb.連続失敗の上限 <= 6:
+        return False, ("連続失敗の上限が %d。実測では 3以下に事故は1件も無く、"
+                       "4・6・22 の3件がすべて本物だった。3〜6 の外だと"
+                       "**誤爆するか、本物を逃す**" % hb.連続失敗の上限)
+
+    なぜ = _事故時点の写しへ向ける(hb)
+    if なぜ:
+        return False, なぜ
+
+    窓 = 24 * 30
+    ループ = hb.失敗の繰り返し(窓)
+    捏造 = hb.やっていないのに言う(窓)
+
+    事故 = {"3aab972c": ("conversations_send", 22),
+            "7e2888e5": ("exec", 6),
+            "219d4f5b": ("exec", 4)}
+    if not ループ:
+        return False, ("直近30日の記録に、続けて失敗した会話が1件も無い。"
+                       "記録が消えたなら、この試験はもう証拠になっていない")
+    拾った = {s: (n, c) for s, n, c in ループ}
+    抜け = [s for s in 事故 if s not in 拾った]
+    if 抜け:
+        return False, "名指しした事故が入っていない: %s" % "／".join(抜け)
+    for s, (道, 回) in 事故.items():
+        if 拾った[s] != (道, 回):
+            return False, ("%s を %s×%s 回と読んだ（%s×%s 回のはず）"
+                           % (s, 拾った[s][0], 拾った[s][1], 道, 回))
+    if len(ループ) > 3:
+        return False, ("30日で %d 件拾った（本物は3件）。%d 件は誤爆"
+                       % (len(ループ), len(ループ) - 3))
+
+    if len(捏造) != 1 or 捏造[0][0] != "7e2888e5":
+        return False, ("やっていないのに完了と言った会話を %d 件拾った"
+                       "（7e2888e5 の1件だけのはず）: %s"
+                       % (len(捏造), [x[0] for x in 捏造][:3]))
+
+    # 中身の判定が効いているか。**完了語が無ければ拾わない／成功なら拾わない。**
+    if hb.完了語.search("あとで直します。まだ終わっていません。"):
+        return False, "未来形（直します）を完了と読んだ（予告と主張を混ぜている）"
+    if not hb.完了語.search("削除しました"):
+        return False, "「削除しました」を完了と読まなかった"
+
+    # 配線。判定があっても、house-brief が呼んでいなければ効かない。
+    try:
+        src = open(path).read()
+    except OSError:
+        return False, "house-brief を読めない"
+    本体 = src.split("def collect", 1)[-1].split("\ndef ", 1)[0]
+    for 名 in ("失敗の繰り返し(", "やっていないのに言う("):
+        if 名 not in 本体:
+            return False, "house-brief が %s を呼んでいない（判定はあるが効かない）" % 名
+
+    return True, ("事故時点の記録の写し（%s までの30日）に当てて、続けて失敗した会話3件を回数ごと言い当て"
+                  "（誤爆0）、やっていないのに完了と言った1件も拾った"
+                  "（上限 %d 回・未来形は拾わない）"
+                  % (CLAIM_FIXTURE_AT.strftime("%m/%d %H:%M"), hb.連続失敗の上限))
+
+
+def drill_marks():
+    """**受領証の印が、走りの本当の終わり方と合っているか。**（2026-09-24）
+
+    中身は `guardrun-印の試験`（23通りを実走）。ふつうの終わり方・書いたうえでの失敗・
+    中の命令による見届けの記録の偽造／消去／FIFO／リンク・壁が立たない（対話あり・なし）。
+    2026-09-23 に直した穴は、ここに入るまで scratchpad の使い捨てでしか試されていなかった。
+    直す前の版（96d0f08）に当てると 9 件が ✗ になり、FIFO で固まる——それを捕まえるための項目。
+
+    **時間切れを付ける。**固まる退行そのものが試験の対象なので、待ち続けてはいけない。"""
+    tool = os.path.join(BIN, "guardrun-印の試験")
+    if not os.path.exists(tool):
+        return False, "guardrun-印の試験 が無い（印の試験が消えている）"
+    try:
+        p = subprocess.run([sys.executable, tool, os.path.join(BIN, "guardrun.py")],
+                           capture_output=True, text=True, timeout=300,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as e:
+        途中 = (e.stdout or b"")
+        途中 = 途中.decode("utf-8", "replace") if isinstance(途中, bytes) else 途中
+        最後 = [x for x in 途中.splitlines() if x.strip()][-1:] or ["（出力なし）"]
+        return False, "300秒で返らなかった＝guardrun が固まった（最後に通ったもの: %s）" % 最後[0][:60]
+    except Exception as e:                               # noqa: BLE001
+        return False, "印の試験を呼べなかった（%s）" % type(e).__name__
+    try:
+        要約 = json.loads([x for x in p.stdout.splitlines() if x.startswith("{")][-1])
+    except (IndexError, ValueError):
+        return False, "印の試験の結果が読めない: %s" % (p.stdout + p.stderr)[-160:]
+    if 要約["落ちた"]:
+        return False, "%d/%d 通過・落ちた: %s" % (要約["通った"], 要約["全部"], "／".join(要約["落ちた"][:6]))
+    # **対話の Ctrl-C / Ctrl-Z が中へ届くかも回す。**（2026-09-24・M7）pty で端末を作って送る。
+    対話 = os.path.join(BIN, "guardrun-対話の試験")
+    if os.path.exists(対話) and not sys.platform.startswith("win"):
+        try:
+            q = subprocess.run([sys.executable, 対話, os.path.join(BIN, "guardrun.py")], capture_output=True,
+                               text=True, timeout=180, stdin=subprocess.DEVNULL)
+        except Exception as e:                           # noqa: BLE001
+            return False, "対話の試験を呼べなかった（%s）" % type(e).__name__
+        if q.returncode != 0:
+            return False, "対話の Ctrl-C/Ctrl-Z が中へ届かない: %s" % q.stdout.strip()[-160:]
+    # **Windows の用意の試験も一緒に回す。**（2026-09-24・C2）実機が無くても差し替えで回る。
+    for 窓 in (os.path.join(BIN, "guardrun-窓の用意の試験"), os.path.join(BIN, "guardrun-窓のCPUの試験")):
+        if not os.path.exists(窓):
+            continue
+        try:
+            q = subprocess.run([sys.executable, 窓], capture_output=True, text=True, timeout=120,
+                               stdin=subprocess.DEVNULL, env=dict(os.environ, PYTHONPATH=BIN))
+        except Exception as e:                           # noqa: BLE001
+            return False, "%s を呼べなかった（%s）" % (os.path.basename(窓), type(e).__name__)
+        if q.returncode != 0:
+            return False, "%s が落ちた: %s" % (os.path.basename(窓), (q.stdout + q.stderr).strip()[-160:])
+    return True, "%d 通りすべて本当の終わり方どおりの印（偽造・消去・FIFO・リンク・壁が立たない を含む）" % 要約["全部"]
+
+
+DRILLS = [
+    ("pulse",    "心拍の相互監視",       drill_pulse,    False),
+    ("claim",    "やっていないのに言う", drill_claim,    False),
+    ("miscopy",  "識別子の写し損ね",     drill_miscopy,  False),
+    ("budget",   "外へ出る量の上限",     drill_budget,   False),
+    ("beacon",   "外の証人が居るか",     drill_beacon,   False),
+    ("heal",     "直す者が手を消さないか", drill_heal,    False),
+    ("rewrite",  "戻したそばから書き直される", drill_rewrite, False),
+    ("keep",     "守りの設定が消えないか", drill_keep,   False),
+    ("silence",  "黙りが見えるか",       drill_silence,  False),
+    ("spin",     "空回りの見分け",       drill_spin,     False),
+    ("standoff", "両方同時に倒れる",     drill_standoff, False),
+    ("interval", "間隔の食い違い",       drill_interval, False),
+    ("notify",   "知らせが届く先",       drill_notify,   False),
+    ("lock",     "二重に走らない鍵",     drill_lock,     False),
+    ("guardlib", "共有部品の検査",       drill_guardlib, False),
+    ("qwc",      "コードを書く側の故障", drill_qwc,      False),
+    ("thrash",   "積み直しの取り合い",   drill_thrash,   False),
+    ("busy",     "働いているかの見分け", drill_busy,     False),
+    ("escape",   "壁から抜け出せるか",   drill_escape,   False),
+    ("limits",   "量と時間の上限",       drill_limits,   False),
+    ("silent",   "黙って終われないこと", drill_silent,   False),
+    ("walled",   "壁が使われているか",   drill_walled,   False),
+    ("marks",    "受領証の印が正直か",   drill_marks,    False),
+    ("ollama",   "頭脳を止めて復旧",     drill_ollama,   True),
+    ("gateway",  "受け口を黙らせて復旧", drill_gateway,  True),
+    ("config",   "設定を壊して巻き戻す", drill_config,   True),
+]
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = {a for a in sys.argv[1:] if a.startswith("-")}
+
+    if "--list" in flags:
+        print("試せるもの:\n")
+        for name, title, _, heavy in DRILLS:
+            print(f"  {name:9} {title}" + ("   ※ サービスが一時的に止まる" if heavy else ""))
+        print("\n  既定では ※ 印は走らせない。--full で全部。")
+        print("  --quiet … 通れば何も言わない（定時実行用）")
+        return 0
+
+    # 定時に走らせるときは、通ったことをいちいち言わない。
+    # 落ちたぶんだけは、記録に残るよう画面にも出す（launchd がログに書く）。
+    quiet = "--quiet" in flags
+
+    chosen = [d for d in DRILLS if (d[0] in args) or (not args and (not d[3] or "--full" in flags))]
+    if not chosen:
+        print("その名前の訓練はありません。--list で一覧。")
+        return 1
+
+    if "--dry-run" in flags:
+        print("走らせるもの:")
+        for name, title, _, heavy in chosen:
+            print(f"  {name:9} {title}" + ("   ※ 一時的に止まる" if heavy else ""))
+        return 0
+
+    # 手入れ中は訓練しない。**この道具は「わざと壊す」側**なので、
+    # 直している最中に走ると、直している人の隣で別のものを壊すことになる。
+    # 05:30 に走るぶん、朝の手入れと重なりやすい。
+    # `--list` と `--dry-run` はここより手前で帰るので、見るだけなら手入れ中でも通る。
+    held, why = stand_down(G)
+    if held:
+        state = G.load_state()
+        skips = int(state.get("skips", 0)) + 1
+        state["skips"] = skips
+        G.save_state(state)
+        if not quiet:
+            print(f"  {why}")
+            print("  訓練は見送りました。手入れが終わってから走らせてください。")
+        # **見送りっぱなしにはしない。**心拍は見送った回にも残るので、
+        # watchdog から見ると「通った日」と見分けが付かない。
+        # 黙って見送り続けると、**訓練が止まっていることに誰も気づけなくなる**——
+        # この一式がいちばん嫌う「壊れているのに壊れていると言わない」形そのもの。
+        if skips >= SKIP_MAX:
+            G.tell_once(state, "skip_told",
+                        f"見張りの訓練を {skips} 回続けて見送っています"
+                        f"（毎回、手入れ中の印が置かれていました）。\n"
+                        f"訓練が走っていないので、**見張りが本当に働くかは確かめられていません**。\n"
+                        f"  claw hold      … 誰が印を置いているか見る\n"
+                        f"  guard-drill    … 手で1回走らせる")
+        return 0
+
+    # 訓練中の印。あとで記録を読む人が、本物の障害と取り違えないため。
+    with open(MARK_FILE, "w") as f:
+        json.dump({"at": datetime.now().isoformat(timespec="seconds"),
+                   "drills": [d[0] for d in chosen]}, f, ensure_ascii=False)
+    G.log("訓練を始めた: " + ", ".join(d[0] for d in chosen))
+
+    if not quiet:
+        print(f"\n見張りの訓練（{len(chosen)} 項目）\n", flush=True)
+    results, stopped = [], False
+    try:
+        for i, (name, title, fn, heavy) in enumerate(chosen):
+            if not quiet:
+                print(f"  {DOT} {title} …", end="", flush=True)
+            try:
+                sys.stdout.flush()
+            except BrokenPipeError:
+                pass
+            t0 = time.time()
+            try:
+                ok, detail = fn()
+            except Exception as e:                       # noqa: BLE001
+                ok, detail = False, f"訓練そのものが失敗した（{type(e).__name__}: {e}）"
+            if not quiet:
+                print("\r\033[K", end="", flush=True)
+            if ok is None:
+                # **測っていない。**通った数にも落ちた数にも入れない。
+                # 走らなかった項目と同じ扱いになる（下で名指しされる）。
+                if not quiet:
+                    print("\r\033[K", end="", flush=True)
+                    say(DOT, title, f"測れなかった — {detail}")
+                G.log(f"{name}: 測れなかった — {detail}")
+                continue
+            if not quiet or not ok:
+                say(OK if ok else NG, title, f"{detail}（{int(time.time()-t0)}秒）")
+            results.append((name, title, ok, detail))
+            G.log(f"{name}: {'通った' if ok else '落ちた'} — {detail}")
+            if not ok:
+                # **落ちたから止める、はやめた（2026-09-13）。**
+                #
+                # 判定が赤いだけなら、この項目は何も壊していない——
+                # 「見つけた」と言っているだけである。そこで打ち切ると、
+                # 直すまでの間ずっと後ろの項目が走らなくなる。
+                #
+                # 止めるのは**家が実際に傷んだとき**だけ。訓練はサービスを
+                # 壊すので、壊れたまま次の訓練を走らせると傷が重なる。
+                # 判断は後始末と同じ `healthy()` に任せる（物差しを2つ持たない）。
+                # 一発で見ずに少し待つのは、ollama が誰かの依頼を処理中だと
+                # 一時的に赤くなるため（後始末の確認と同じ理由）。
+                if not wait_until(healthy, 60, 5):
+                    stopped = True
+                    残り = [t for _, t, _, _ in chosen[i + 1:]]
+                    if not quiet:
+                        say(NG, "ここで止めた",
+                            "家が傷んでいるので残りは走らせない"
+                            + (f"（残り {len(残り)} 項目）" if 残り else ""))
+                    G.log("家が傷んだのでここで止めた（残り %d 項目）" % len(残り))
+                    break
+    finally:
+        try:
+            os.remove(MARK_FILE)
+        except OSError:
+            pass
+        G.beat()
+
+    # 訓練が傷を残していないかを、合否に含める。
+    #
+    # 「壊れ方を見つけられたか」だけを見ていたら、ollama を止めたまま
+    # 「2項目すべて通りました」と表示した。訓練が一番の障害要因になる、
+    # というのがまさにこれで、後始末まで見ないと合格とは呼べない。
+    if not quiet:
+        print(f"  {DOT} 後始末の確認 …", end="", flush=True)
+        sys.stdout.flush()
+    left_ok = wait_until(healthy, 180, 5)
+    if not quiet:
+        print("\r\033[K", end="", flush=True)
+    if not quiet or not left_ok:
+        say(OK if left_ok else NG, "後始末の確認",
+            "傷は残っていない" if left_ok else "**訓練が壊したまま戻っていない。手で見ること**")
+    results.append(("cleanup", "後始末の確認", left_ok,
+                    "傷は残っていない" if left_ok else "壊したまま戻っていない"))
+    G.log(f"後始末: {'傷なし' if left_ok else '戻っていない'}")
+
+    # **「走った」と「やり切った」を別の跡にする。**
+    #
+    # 2026-09-14 実測：鍵が取れないと訓練は**終了コード0・画面は無言・
+    # 心拍は更新**で帰る（`もう1つ走っているので、この回は何もしない`）。
+    # 心拍を見ている点呼と watchdog からは、**毎日空振りしていても
+    # 「検証されている」に見える。**この家がいちばん嫌う形そのもの。
+    #
+    # 心拍は guardlib が finally で必ず残す（それは正しい——生きている印だから）。
+    # だからここでは**項目を最後まで回したときだけ**別の跡を残す。
+    # 点呼は pulse を並べて拾うので、置いた瞬間に台帳へ載る
+    # （期限は silence-contracts.json に1行。既定は鳴る側）。
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        _p = os.path.join(OPENCLAW, "pulse", "guard-drill-完走.json")
+        os.makedirs(os.path.dirname(_p), exist_ok=True)
+        with open(_p, "w") as _f:
+            _json.dump({"at": _dt.now().isoformat(timespec="seconds")}, _f)
+    except OSError:
+        pass
+
+    bad = [r for r in results if not r[2]]
+
+    # **同じ落ち方で毎日鳴らさない。**
+    # 毎日走らせる以上、直すまで同じ知らせが届き続ける。それは数日で「またか」に変わり、
+    # 本物の知らせまで読み飛ばされるようになる。知らせるのは**変わったとき**だけにする。
+    # 直ったことは必ず言う（黙って消えると、直ったのか見張りが死んだのか分からない）。
+    state = G.load_state()
+    was = state.get("failed") or []
+    now_failed = sorted(r[0] for r in results if not r[2])
+    # **走らせた項目だけで、落ちている一覧を書き換える。**（2026-09-23）
+    # 一部の項目だけ手で走らせると、走らせていない項目の「落ちていた」まで消え、
+    # 「訓練が通るようになりました（前回は2項目落ちていました）」と知らせていた
+    # ——claim と miscopy は走ってもいないのに。走らせなかった項目は前回のまま持ち越す。
+    今回走った = {r[0] for r in results}
+    持ち越し = sorted(n for n in was
+                  if n not in 今回走った and n in {d[0] for d in DRILLS})
+    now_failed = sorted(set(now_failed) | set(持ち越し))
+
+    # 今回は実際に走った。見送りの数え上げはここで戻す
+    # （戻さないと、いつか通った日の翌日に「3回見送っています」と嘘をつく）。
+    state.pop("skips", None)
+    state.pop("skip_told", None)
+
+    走った = {r[0] for r in results}
+    走らなかった = [t for n, t, _, _ in chosen if n not in 走った]
+    if 走らなかった:
+        # **走らなかったことを、通ったことの中に混ぜない。**
+        # 混ぜると「14項目すべて通りました」が、実際には3項目しか
+        # 試していない日にも出る。
+        G.log("走らせていない: " + ", ".join(走らなかった))
+
+    if bad:
+        print(f"\n  {len(bad)} 項目が落ちました。"
+              + (f"家が傷んだのでここで止めました（走らせていない {len(走らなかった)} 項目: "
+                 + "、".join(走らなかった) + "）。" if stopped else ""))
+        if now_failed != was:
+            G.notify("見張りの訓練で問題が見つかりました。\n"
+                     + "\n".join(f"・{t}: {d}" for _, t, ok, d in results if not ok)
+                     + "\n見張りが黙って壊れている可能性があります。")
+            state["failed"] = now_failed
+        else:
+            G.log("同じ落ち方が続いている（知らせは出さない）")
+    else:
+        if not quiet:
+            print(f"\n  {len(results)} 項目すべて通りました。"
+                  + (f"（{len(走らなかった)} 項目は走らせていません）" if 走らなかった else ""))
+        if 持ち越し:
+            # 走らせた項目は通ったが、走らせていない項目が前回落ちている。**直ったとは言わない。**
+            G.log("走らせた項目は通った（落ちたままの %s は今回走らせていない）" % "、".join(持ち越し))
+            state["failed"] = now_failed
+        else:
+            if was:
+                G.notify(f"見張りの訓練が通るようになりました（前回は {len(was)} 項目落ちていました）。")
+                G.log("訓練が通るようになった")
+            state.pop("failed", None)
+    G.save_state(state)
+
+    # どんな終わり方でも、いまの状態を最後に見せる（訓練が傷を残していないか）
+    #
+    # 外のコマンドは画面に直接書くので、先に自分のぶんを出し切っておく。
+    # これを忘れると、結果より先に claw status が割り込んで読めなくなる。
+    if not quiet:
+        print()
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            pass
+        try:
+            subprocess.run(道具の呼び方([os.path.join(BIN, "claw"), "status"]), check=False)
+        except Exception:
+            pass
+
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""guardrun-sweep — 黙って終わった走りを見つけて決着させる（この家の配線）。
+
+`guardrun.py` 側は持ち運べるように何にも依存していない。**知らせ方・鍵・心拍は
+この家のやり方**なので、そちらに混ぜずにここへ置く。向こうを別の機械へ持って
+いくときに、この1本を書き直せば済むようにしてある。
+
+## なぜ定時で回すのか
+
+予告（走り出す前に置く「まだ終わっていない」）は、**誰かが読まなければ
+ただのファイルである。**読む者が居ないと、黙りを記録する仕組みを足しただけで
+黙りは残る——この家が何度も踏んだ形（記録は残っていたが誰も読んでいなかった）。
+
+だから5分おきに読む。そして**この見張り自身が黙ったら、点呼が拾う**
+（launchd の StartInterval が契約になり、心拍が跡になる。台帳は登録した
+瞬間に載るので、こちらから watchdog に名前を書き足す必要は無い）。
+
+## 何をするか・しないか
+
+    親が死んでいる走り    受領証を作り、壁の中に残ったものを始末して、知らせる
+    親が生きている走り    **触らない。**期限を過ぎていれば知らせるだけ
+    それ以外              何もしない
+
+**生きている走りに手を出さない**のは、直す側と見張る側が互いを障害と見なして
+殴り合うのを避けるため（2026-09-06 に実際にやった）。期限超過を殺さないのは、
+それが `run()` の壁時計が効いていない印だからで、こちらが肩代わりすると
+**本当の壊れ方が隠れる。**
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, stand_down  # noqa: E402
+
+G = Guard("guardrun-sweep")
+
+
+def 本文(x):
+    """知らせに「何が起きたか・どう確かめるか・どう直すか」を全部入れる。
+
+    2026-09-10、model-guard の警報が原因・確認方法・直し方を全部書いていた
+    おかげで10分で特定できた。知らせは読んだ人が次の一手を打てる形にする。"""
+    行 = ["黙って終わった走りがありました。",
+          "  作業場: %s" % x.get("作業場"),
+          "  命令  : %s" % " ".join(x.get("命令") or [])[:120],
+          "  始め  : %s" % x.get("始めた時刻")]
+    for y in (x.get("理由") or [])[:5]:
+        行.append("  ・%s" % y)
+    残 = (x.get("残党") or {}).get("生き残った") or []
+    if 残:
+        行.append("  始末できなかったものが残っています: pid %s"
+                  % "・".join(str(p) for p in 残))
+        行.append("  確かめる: ps -p %s" % ",".join(str(p) for p in 残))
+    if x.get("受領証"):
+        行.append("  受領証: %s" % x.get("受領証"))
+        行.append("  中身を見る: python3 -m json.tool '%s'" % x.get("受領証"))
+    else:
+        行.append("  受領証: **書けなかった**（置き場の容量・権限を確かめる）")
+    return "\n".join(行)
+
+
+def 超過の本文(x):
+    return "\n".join([
+        "走りが期限を過ぎたのに終わっていません（親は生きています）。",
+        "  作業場: %s" % x.get("作業場"),
+        "  超過  : %s 秒" % x.get("超過秒"),
+        "  これは掃除の担当ではありません。**run() の壁時計か採点が固まっている**",
+        "  印です（壁時計で殺せていれば、この状態にはなりません）。",
+        "  確かめる: ps -o pid=,stat=,etime=,command= -p <親pid>",
+        "            python3 -m json.tool '%s/予告.json'"
+        % os.path.join(os.path.expanduser("~/.guardrun/runs"), str(x.get("id"))),
+        "  直す    : 固まっている親を落とせば、次の掃除が中断として決着させます。",
+    ])
+
+
+def main():
+    引数 = sys.argv[1:]
+    調べるだけ = ("--report" in 引数) or ("--dry-run" in 引数)
+
+    try:
+        import guardrun
+    except Exception as e:
+        # **読めないことは、静かな正常より悪い。**
+        G.log("guardrun が読めない: %s" % e)
+        return 1
+
+    held, why = stand_down(G, 調べるだけ)
+    if held:
+        return 0
+
+    s = guardrun.sweep(kill=not 調べるだけ)
+
+    if 調べるだけ:
+        print("置き場: %s" % s["置き場"])
+        print("  走行中 %d 件・期限超過 %d 件・中断 %d 件（未完 %d 件を見た）"
+              % (len(s["走行中"]), len(s["期限超過"]), len(s["中断"]), s["見た"]))
+        for x in s["走行中"]:
+            print("  ● %s  %s" % (x["id"], x.get("作業場")))
+        for x in s["期限超過"]:
+            print("  ! %s  %s 秒超過" % (x["id"], x.get("超過秒")))
+        for x in s["中断"]:
+            print("  ✗ %s  %s" % (x["id"], "／".join(x.get("理由") or [])))
+        for d, わけ in s.get("読めない予告") or []:
+            print("  ? %s  %s" % (d, わけ))
+        return 0
+
+    state = G.load_state()
+    for x in s["中断"]:
+        # **一度だけ言えばよい。**この掃除で受領証が書かれたので、
+        # 同じ走りが次の掃除で出てくることはない（出てきたら書けていない）。
+        G.log("中断として決着: %s（%s）" % (x["id"], "／".join(x.get("理由") or [])))
+        G.notify(本文(x))
+
+    開いている = {x["id"] for x in s["期限超過"]} | {x["id"] for x in s["走行中"]}
+    for x in s["期限超過"]:
+        G.tell_once(state, "over:%s" % x["id"], 超過の本文(x))
+    # **読めない予告も知らせる。**（2026-09-24）その走りは終わったのかも分からない。
+    # 数えるだけで知らせないと、sweep が数えても誰の目にも入らない。
+    読めない = {d for d, _w in s.get("読めない予告") or []}
+    for d, わけ in s.get("読めない予告") or []:
+        G.tell_once(state, "unread:%s" % d,
+                    "guardrun の予告が読めません（%s）。\n  場所: %s\n"
+                    "  その走りが終わったのか、黙って落ちたのかを確かめられません。\n"
+                    "  確かめる: ls -la '%s'" % (わけ, d, d))
+    # 終わった走りの覚え書きは捨てる。**残すと、同じ番号が来た日に黙る。**
+    for k in [k for k in state if k.startswith("over:")
+              and k[len("over:"):] not in 開いている]:
+        state.pop(k)
+    for k in [k for k in state if k.startswith("unread:") and k[len("unread:"):] not in 読めない]:
+        state.pop(k)
+    G.save_state(state)
+
+    if s["中断"] or s["期限超過"]:
+        G.log("掃除: 中断 %d 件・期限超過 %d 件" % (len(s["中断"]), len(s["期限超過"])))
+    # **見つけたこと自体は失敗ではない。**知らせはもう出したので、
+    # ここで 0 以外を返すと点呼が同じことをもう一度鳴らす（担当が重なる）。
+    return 0
+
+
+if __name__ == "__main__":
+    # **鍵と心拍は土台に任せる（`G.run`）。**自分で書いていたせいで、
+    # 手入れ中の印で見送った回に心拍が残らず、点呼から
+    # 「launchd は走らせたのに心拍が更新されていない＝走り切る前に消えた」と
+    # 見えていた（2026-09-12、点呼が実際に捕まえた）。
+    #
+    # 心拍は「走り切った跡」であって「仕事をした跡」ではない。
+    # 見送りも、例外も、走り切りである。だから finally で必ず残す土台に寄せる。
+    # ほかの見張り5本は最初からこうなっていた——**同じことを2か所に書くと、
+    # あとから足したほうがずれる。**
+    sys.exit(G.run(main))

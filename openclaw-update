@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""
+openclaw-update — OpenClaw を、壊さずに更新する／壊れたのを直す。
+
+    openclaw-update            更新して、整えて、起こす
+    openclaw-update --recover  更新はせず、いまの壊れだけ直す
+    openclaw-update --check    何も書かずに、いま何が起きるかだけ出す
+    openclaw-update --yes      止まらずに通す（既定は危ないところで止まって聞く）
+
+## なぜ要るか
+
+2026-09-06、管理画面から更新をかけたら gateway が起動しなくなり、
+**Discord と LINE が同時に沈んだ**。連絡手段が両方消えた。
+原因は新しい版が持ち込んだ起動時の関門（作業フォルダの変換が要る）で、
+それ自体は `openclaw doctor --fix` で通る。**難しいのは順番のほうだった。**
+
+手で直そうとすると、次の4つに順番に引っかかる。
+
+1. **gateway を止めずに設定を戻しても消える。**
+   起動に失敗する gateway は、死ぬ前に設定を自分の形へ書き直す。
+   10秒おきにそれをやるので、戻した設定は次の周回で消える。
+   実際 `config-guard --rollback` は「戻しました」と表示しながら
+   1バイトも変えていなかった（あちらは実物を2回読むように直してある）。
+
+2. **見張りが gateway を起こしに来る。**
+   こちらが意図して止めているのに、あちらは障害と読んで再登録する。
+   書き戻したばかりの設定が、それでまた消える。
+   **2026-09-06 訂正: 起こしていたのは watchdog ではなく line-guard。**
+   watchdog は手入れ中の印を見ていたが、line-guard は見ていなかった。
+   40分の作業中に3回 gateway を起こし直し、そのたび「LINEから届かない」と
+   誤診して生きたトンネルを6回張り替え、URL を6回変えた。
+   いまは line-guard / model-guard / qwc-guard も印を見る（`claw hold`）。
+
+3. **プラグインは install では入れ替えられない。**
+   すでに入っているものに `plugins install` を当てると、本体は
+   「その置き場はもう自分が見ている」と言って断る。正しくは
+   `plugins update <id>`。渡すのは npm の名前ではなく id
+   （`@openclaw/discord` ではなく `discord`）。
+
+4. **版を上げると、廃止された設定項目で設定が丸ごと無効になる。**
+   Discord 2026.9.2 は `gatewayInfoTimeoutMs` `gatewayReadyTimeoutMs`
+   `gatewayRuntimeReadyTimeoutMs` を受け付けない。2026.7.1 では通っていたので、
+   プラグインを揃えた瞬間に設定の検査が落ち、次の手が進まなくなる。
+   `doctor --fix` が外すので、**揃えたら もう一度 doctor を通す**。
+
+## num_ctx の提案について（2026-09-06 訂正）
+
+**「先に contextWindow を 65536 に戻せば doctor の提案も 65536 になる」は誤り。**
+逆で、`contextWindow: 65536` が書いてあること自体が引き金になる。doctor はそれを
+各モデルの欄へ焼き付けてから消し、入れ物側の既定を 16384 にする。
+
+    Removed models.providers.ollama.contextWindow after baking it into
+    explicit model entries.
+    Set models.providers.ollama.params.num_ctx to 16384 for native Ollama
+    compatibility.
+
+**この 16384 は実物に届かない。**入れ物側の既定は「そのモデル自身に num_ctx が
+無かったとき」の控えでしかなく、gemma4:26b は自分の欄に 65536 を持っている。
+本体は後勝ちで model 側を採る（dist/model-qCT5QXYI.js の mergeModelParams、
+`Object.assign` の最後の引数が model 側）。設定のコピーに `doctor --fix` を
+当てて確かめたところ、gemma4:26b は 65536 のまま残った。
+
+だから手順6が見るのは**数字ではなく道筋**。`models.providers.<名前>.params.num_ctx`
+なら素通し、`...models[N].params.num_ctx` なら止める。ここを区別しないと、
+設定を何度 65536 に戻しても手順6が必ず赤くなって先へ進めない。
+
+## やること（この順番に意味がある）
+
+    1. 手入れ中の印を置く      … 見張りに手を出させない（期限つき）
+    2. gateway を登録から外す  … 外さないと以降の書き込みが全部消される
+    3. 退避                    … 設定・実行許可・会話履歴を日付フォルダへ
+    4. 更新                    … --recover のときは飛ばす
+    5. 設定を動いた形に戻す    … 更新が消した項目がここで戻る
+    6. doctor の予告を読む     … num_ctx の提案を「道筋まで」突き合わせる
+    7. 変換する                … doctor --fix
+    8. num_ctx を実物で確認
+    9. プラグインの版を揃える  … plugins update（install では断られる）
+   10. 起こす
+   11. つながったか見る
+
+手順9で設定が無効になったら、もう一度このコマンドを通すこと。
+2周目の手順7が廃止された項目を外し、そこから先へ進む。
+
+## 合否は、このコマンドでは出し切れない
+
+`openclaw health` が Discord につながったと言っても、
+それは**受け口が立った**までしか意味しない。この家のシステムは落ちずに黙るので、
+「立っているのに答えない」が普通に起きる。**往復1回は人がやること。**
+最後にそれを促して終わる。ここを自動で○にしない。
+"""
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import (Guard, OPENCLAW, maintenance_clear,  # noqa: E402
+                      maintenance_hold)
+from modellib import resident_ctx  # noqa: E402
+
+G = Guard("openclaw-update")
+BIN = os.path.expanduser("~/bin")
+CONFIG = os.path.join(OPENCLAW, "openclaw.json")
+APPROVALS = os.path.join(OPENCLAW, "exec-approvals.json")
+STATE_DIR = os.path.join(OPENCLAW, "state")
+GATEWAY = "ai.openclaw.gateway"
+PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{GATEWAY}.plist")
+GATEWAY_PORT = 18789
+STABILITY = os.path.join(OPENCLAW, "logs", "stability")
+
+OK, NG, WARN = "\033[32m●\033[0m", "\033[31m●\033[0m", "\033[33m●\033[0m"
+
+# 手を出さないでほしい時間。更新は npm と変換で数分かかる。
+# guardlib 側で1時間に丸められるので、ここを伸ばしても青天井にはならない。
+HOLD_S = 1800
+
+# 本体と版を揃える相手。ここが取り残されるのが 2026-09-06 の型だった。
+PLUGINS = ["@openclaw/discord", "@openclaw/line"]
+
+CHECK = "--check" in sys.argv
+RECOVER = "--recover" in sys.argv
+YES = "--yes" in sys.argv
+
+
+def say(mark, label, detail=""):
+    print(f"  {mark} {label}" + (f"  {detail}" if detail else ""))
+
+
+def step(n, title):
+    print(f"\n\033[1m{n}. {title}\033[0m")
+
+
+def run(args, timeout=600):
+    """コマンドを実行して (成功したか, 出力) を返す。
+
+    PATH を明示するのは、launchd から呼ばれると node も openclaw も
+    見つからないため。qwc-guard が毎朝 exit 127 で死んでいたのがこれ。
+
+    **標準入力を必ず塞ぐ（2026-09-06・実機で踏んだ）。**
+    `capture_output=True` は出力だけ横取りして、**標準入力は素通しする**。
+    `openclaw doctor` は端末が繋がっていると見て質問を出すが、その質問は
+    横取りされて画面に出ない。**見えない問いかけの前で永久に待つ。**
+    端末の無いところで試すと質問が出ないので、この壊れ方は再現しない。
+
+    **時間切れは自前で始末する。** `subprocess.run(timeout=)` は、子を殺したあと
+    もう一度 timeout なしで読み直す。子が孫（openclaw-doctor）を残していると
+    孫がパイプを握ったままなので、**そこで永久に固まる**。10分で打ち切られず
+    1時間52分走り続けたのがこれ。だから process group ごと落として、
+    後始末の読み取りにも上限を付ける。"""
+    env = dict(os.environ)
+    env["PATH"] = "/opt/homebrew/bin:/opt/homebrew/opt/node/bin:" + \
+                  env.get("PATH", "/usr/bin:/bin")
+    try:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL,
+                             text=True, env=env, start_new_session=True)
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+    try:
+        out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            out, _ = p.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            out = ""
+        return False, f"{timeout}秒で返らないので打ち切りました（{args[0]}）"
+    return p.returncode == 0, (out or "").strip()
+
+
+def waiting(note):
+    """時間のかかる待ちを画面に出す。
+
+    黙って待つと、固まっているのか動いているのか外から分からない。
+    手順6は doctor が数十秒返らないので、ここが無いと「止まった」に見える。"""
+    print(f"  … {note}", end="", flush=True)
+
+
+def done_waiting():
+    print()
+
+
+def ask(question):
+    """止まって聞く。
+
+    **答えられない場所では「進めない」と読む。** cron や launchd から
+    呼ばれると標準入力が無い。そこで黙って通すと、人が見ていないところで
+    危ない側に倒れる。通したいなら --yes を明示すること。"""
+    if YES:
+        print(f"  → {question} … --yes なので進みます")
+        return True
+    if not sys.stdin.isatty():
+        say(NG, "聞ける相手がいないので、ここで止まります",
+            "無人で通すなら --yes")
+        return False
+    try:
+        a = input(f"  ? {question} [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return a in ("y", "yes")
+
+
+# ---------------- 状態を見る ----------------
+
+
+def gateway_loaded():
+    """launchd に登録されているか。**動いているかではない。**
+
+    KeepAlive が付いているので、登録されていれば PID が無い瞬間でも
+    数秒後には起きてくる。こちらが設定を書くなら、外れていることが前提。"""
+    return subprocess.run(["launchctl", "list", GATEWAY],
+                          capture_output=True).returncode == 0
+
+
+def port_open():
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", GATEWAY_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def core_version():
+    ok, out = run(["openclaw", "--version"], timeout=60)
+    if not ok:
+        return None
+    m = re.search(r"(\d{4}\.\d+\.\d+)", out)
+    return m.group(1) if m else None
+
+
+def plugin_id(pkg):
+    """npm の名前 → 本体が呼ぶときの id。@openclaw/discord なら discord。
+
+    `plugins update` も `plugins inspect` も受け取るのは id のほうで、
+    npm の名前を渡すと「そんなものは入っていない」と言われる。"""
+    return pkg.split("/", 1)[-1]
+
+
+def plugin_versions():
+    """入っているプラグインの版。{パッケージ名: 版} を返す。"""
+    found = {}
+    root = os.path.join(OPENCLAW, "npm", "projects")
+    for proj in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        mods = os.path.join(root, proj, "node_modules", "@openclaw")
+        if not os.path.isdir(mods):
+            continue
+        for name in sorted(os.listdir(mods)):
+            pkg = os.path.join(mods, name, "package.json")
+            try:
+                with open(pkg) as f:
+                    d = json.load(f)
+                found[d["name"]] = d["version"]
+            except (OSError, ValueError, KeyError):
+                pass
+    return found
+
+
+def config_num_ctx(model_id="gemma4:26b"):
+    """設定に書いてある、そのモデルの広さ。無ければ None。"""
+    try:
+        with open(CONFIG) as f:
+            d = json.load(f)
+        for m in d["models"]["providers"]["ollama"]["models"]:
+            if m.get("id") == model_id:
+                return m.get("params", {}).get("num_ctx")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def primary_model():
+    """設定で選んである既定のモデル。'ollama/gemma4:26b' → 'gemma4:26b'。"""
+    try:
+        with open(CONFIG) as f:
+            d = json.load(f)
+        return d["agents"]["defaults"]["model"]["primary"].split("/", 1)[-1]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "gemma4:26b"
+
+
+def last_startup_failure():
+    """直近の起動失敗の理由。無ければ None。
+
+    gateway の標準エラーは /dev/null に捨てる設定なので、**ログには出ない。**
+    落ちた理由はここにしか残らない。"""
+    try:
+        files = [f for f in os.listdir(STABILITY) if "startup_failed" in f]
+    except OSError:
+        return None
+    if not files:
+        return None
+    newest = max(files, key=lambda f: os.path.getmtime(os.path.join(STABILITY, f)))
+    try:
+        with open(os.path.join(STABILITY, newest)) as f:
+            return json.load(f).get("error", {}).get("message")
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------- 手順 ----------------
+
+
+def step_hold():
+    """1. 見張りに手を出させない。"""
+    step(1, "手入れ中の印を置く")
+    if CHECK:
+        say(WARN, "--check なので置きません")
+        return True
+    # **命と結びつける。**このコマンドが途中で殺されると `finally` の後片付けが
+    # 走らず、印だけが残る。2026-09-07 にそれが起き、gateway が落ちたまま
+    # 30分ぶん誰も直しに行かなかった。結びつけておけば、殺された時点で
+    # OS が鍵を離し、次の巡回で見張りが戻る。
+    if maintenance_hold("openclaw の更新・復旧", HOLD_S, "openclaw-update",
+                        tie_to_process=True):
+        say(OK, "置きました", f"{HOLD_S // 60}分（置き忘れても期限で切れます）")
+        return True
+    say(NG, "印を置けませんでした")
+    return False
+
+
+def step_stop():
+    """2. gateway を登録から外す。ここが抜けると以降が全部無効になる。"""
+    step(2, "gateway を登録から外す")
+    if not gateway_loaded():
+        say(OK, "もう外れています")
+        return True
+    if CHECK:
+        say(WARN, "登録されています", "本番では外します")
+        return True
+    run(["launchctl", "bootout", f"gui/{os.getuid()}/{GATEWAY}"], timeout=60)
+    for _ in range(20):
+        if not gateway_loaded():
+            say(OK, "外しました")
+            return True
+        time.sleep(0.5)
+    say(NG, "外せませんでした", "このまま進むと書いたものが消されます")
+    return False
+
+
+def step_backup():
+    """3. 退避。ここに戻せば何をしてもやり直せる。"""
+    step(3, "退避する")
+    dest = os.path.join(OPENCLAW, f"退避-{datetime.now().strftime('%Y%m%d-%H%M')}")
+    if CHECK:
+        say(WARN, "本番ではここへ退避します", dest)
+        return True
+    try:
+        os.makedirs(dest, exist_ok=True)
+        for p in (CONFIG, APPROVALS):
+            if os.path.exists(p):
+                shutil.copy2(p, dest)
+        if os.path.isdir(STATE_DIR):
+            shutil.copytree(STATE_DIR, os.path.join(dest, "state"),
+                            dirs_exist_ok=True)
+    except OSError as e:
+        say(NG, "退避できませんでした", str(e))
+        return False
+    say(OK, "退避しました", dest)
+    G.log(f"退避: {dest}")
+    return True
+
+
+def step_upgrade():
+    """4. 本体を更新する。--recover のときは飛ばす。"""
+    step(4, "本体を更新する")
+    before = core_version()
+    if RECOVER:
+        say(OK, "--recover なので更新しません", f"いまの版 {before or '不明'}")
+        return True
+    if CHECK:
+        say(WARN, "本番では npm で最新に上げます", f"いまの版 {before or '不明'}")
+        return True
+    ok, out = run(["npm", "install", "-g", "openclaw@latest"], timeout=900)
+    if not ok:
+        say(NG, "更新できませんでした", out[-300:])
+        return False
+    after = core_version()
+    say(OK, "更新しました", f"{before} → {after}")
+    G.log(f"本体を更新: {before} → {after}")
+    return True
+
+
+def step_restore():
+    """5. 設定を動いた形に戻す。更新が消した項目がここで戻る。
+
+    中身は config-guard に任せる。あちらは書いたあと実物を読み直して
+    確かめるので、「戻したのに戻っていない」をここで受け取れる。"""
+    step(5, "設定を動いた形に戻す")
+    cg = os.path.join(BIN, "config-guard")
+    if not os.path.exists(cg):
+        say(NG, "config-guard がありません")
+        return False
+    if CHECK:
+        ok, out = run([cg, "--diff"], timeout=120)
+        say(WARN, "本番ではこの差を戻します")
+        print("\n".join("      " + l for l in out.splitlines()[:20]) or "      （差なし）")
+        return True
+    ok, out = run([cg, "--rollback", "--stop-gateway"], timeout=300)
+    if not ok:
+        say(NG, "戻せませんでした")
+        print("\n".join("      " + l for l in out.splitlines()[:8]))
+        return False
+    say(OK, "戻しました（実物で確認済み）")
+    return True
+
+
+def num_ctx_suggestions(out):
+    """doctor の予告から num_ctx の提案を拾い、(道筋, 値) の一覧で返す。
+
+    **値だけを見てはいけない。**doctor は2種類の提案を同じ言い方でする。
+
+        models.providers.ollama.params.num_ctx to 16384   ← 入れ物側の既定
+        models.providers.ollama.models[1].params.num_ctx  ← その model 自身
+
+    前者は「そのモデル自身に num_ctx が無かったときの控え」でしかない。
+    本体は Object.assign の後勝ちで model 側を優先する
+    （dist/model-qCT5QXYI.js の mergeModelParams: 引数の最後が model 側）。
+    実測でも doctor --fix 後の gemma4:26b は 65536 のまま残った。
+    ここを区別しないと、設定を何度 65536 に戻しても手順6が必ず赤くなる。
+
+    予告は枠線で折り返されるので、飾りを外して1本につないでから読む。"""
+    flat = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    flat = re.sub(r"[│┃|╮╯╭╰─]", " ", flat)
+    flat = re.sub(r"\s+", " ", flat)
+    found = []
+    for m in re.finditer(r"([A-Za-z0-9_.\[\]]*num_ctx) to (\d+)", flat):
+        found.append((m.group(1), int(m.group(2))))
+    return found
+
+
+def is_provider_default(dotted):
+    """その道筋は入れ物側の既定か。models[...] を挟んでいれば model 自身。"""
+    return re.fullmatch(r"models\.providers\.[^.\[\]]+\.params\.num_ctx",
+                        dotted) is not None
+
+
+def step_preview():
+    """6. doctor の予告を読み、num_ctx の提案を実物と突き合わせる。
+
+    **ここが今回の急所。**提案された広さが、いま載っているものと違えば、
+    そのまま通すと積み直しが起きて qwc が死ぬ。
+    2026-08-31 に 8192 決め打ちで同じことが起きている。
+
+    ただし止めるのは **model 自身への提案だけ**。入れ物側の既定は実物に
+    届かないので、そこで止めると通る場面が永久に通らなくなる
+    （2026-09-06、--recover が手順6から進めなくなった）。
+    最後の砦は手順8で、あちらは書かれた結果を実物と突き合わせる。"""
+    step(6, "doctor の予告を読む")
+    waiting("doctor に聞いています（30秒〜2分）")
+    ok, out = run(["openclaw", "doctor"], timeout=300)
+    done_waiting()
+    if not ok and "打ち切り" in out:
+        say(NG, out)
+        return False
+    found = num_ctx_suggestions(out)
+    model = primary_model()
+    loaded = resident_ctx(model)
+    want = loaded or config_num_ctx(model)
+
+    if loaded:
+        say(OK, f"いま載っている広さ  {loaded}", f"（{model}）")
+    else:
+        say(WARN, f"{model} は載っていません", f"設定の値で見ます（{want}）")
+
+    if not found:
+        say(OK, "num_ctx の提案はありません")
+        return True
+
+    fallback = sorted({n for d, n in found if is_provider_default(d)})
+    direct = sorted({n for d, n in found if not is_provider_default(d)})
+
+    if fallback:
+        say(OK, f"入れ物側の既定  {fallback}",
+            "model 側が後勝ちなので実物には届きません")
+
+    bad = [n for n in direct if want and n != want]
+    if not bad:
+        if direct:
+            say(OK, f"提案された広さ  {direct}", "実物と一致")
+        return True
+
+    # --check では手順5（設定を戻す）を実行していないので、doctor はまだ
+    # 戻す前の設定を見ている。**予告のこの食い違いは、本番の食い違いではない。**
+    # ここで False を返すと、本番なら通る場面で予告だけ必ず赤くなる。
+    if CHECK:
+        say(WARN, f"提案された広さ  {sorted(set(bad))}", f"実物は {want}")
+        print("     ただし --check では手順5（設定を戻す）を通していません。")
+        print(f"     本番では先に contextWindow が {want} に戻るので、提案も変わります。")
+        print("     戻したうえでなお食い違えば、本番はそこで止まります。")
+        return True
+
+    say(NG, f"提案された広さ  {sorted(set(bad))}", f"実物は {want}")
+    print(f"     {model} 自身への提案なので、そのまま通ると実物が変わります。")
+    print("     ollama は広さが違えば同じモデルでも積み直すので、")
+    print("     処理中の依頼が途中で消えます（2026-08-31 と同じ壊れ方）。")
+    print(f"     その model の params.num_ctx を {want} にしてから、もう一度。")
+    return False
+
+
+def step_migrate():
+    """7. 変換する。作業フォルダ・実行許可・会話履歴がまとめて変わる。"""
+    step(7, "変換する（doctor --fix）")
+    if CHECK:
+        say(WARN, "本番では doctor --fix を実行します")
+        return True
+    if not ask("設定・実行許可・会話履歴を変換します。進めますか？"):
+        return False
+    waiting("変換しています（数分かかります）")
+    ok, out = run(["openclaw", "doctor", "--fix", "--yes", "--non-interactive"],
+                  timeout=900)
+    done_waiting()
+    if not ok:
+        say(NG, "変換に失敗しました", out[-400:])
+        return False
+    say(OK, "変換しました")
+    G.log("doctor --fix を実行")
+    return True
+
+
+def step_verify_ctx():
+    """8. 書かれた広さを実物で確かめる。予告と結果が一致するとは限らない。"""
+    step(8, "広さを確かめる")
+    model = primary_model()
+    want = resident_ctx(model) or config_num_ctx(model)
+    got = config_num_ctx(model)
+    if got is None:
+        say(WARN, "設定に num_ctx がありません", f"{model}")
+        return True
+    if want and got != want:
+        say(NG, f"設定の広さが {got}", f"実物は {want}")
+        return False
+    say(OK, f"設定の広さ  {got}", "実物と一致")
+    return True
+
+
+def step_plugins():
+    """9. プラグインの版を本体に揃える。
+
+    本体だけ上がって Discord と LINE が取り残されるのが 2026-09-06 の型。
+    本体が新しい版を前提に探すファイルが、古い部品側に無い。"""
+    step(9, "プラグインの版を揃える")
+    core = core_version()
+    have = plugin_versions()
+    if not core:
+        say(WARN, "本体の版が読めないので飛ばします")
+        return True
+    behind = [p for p in PLUGINS if have.get(p) and have[p] != core]
+    for p in PLUGINS:
+        v = have.get(p)
+        mark = OK if v == core else (WARN if v else NG)
+        say(mark, f"{p:<20} {v or '入っていない'}", "" if v == core else f"本体は {core}")
+    if not behind:
+        return True
+    if CHECK:
+        say(WARN, "本番ではここを揃えます", " / ".join(behind))
+        return True
+    if not ask(f"{len(behind)} 個を {core} に揃えますか？"):
+        return False
+    for p in behind:
+        # **install ではなく update。**すでに入っているものに install を当てると、
+        # 本体は「その置き場はもう自分が見ている」と言って断る
+        # （2026-09-06、手順9がここで止まった）。断り文自身が update を指している。
+        # 渡すのは npm の名前ではなく id（@openclaw/discord → discord）。
+        ok, out = run(["openclaw", "plugins", "update", plugin_id(p)], timeout=900)
+        if not ok:
+            say(NG, f"{p} を揃えられませんでした", out[-200:])
+            return False
+        say(OK, f"{p} を {core} にしました")
+    G.log(f"プラグインを揃えた: {', '.join(behind)}")
+    return True
+
+
+def step_start():
+    """10. 起こす。立ったことは、ポートが開いたかで見る。"""
+    step(10, "起こす")
+    if CHECK:
+        say(WARN, "本番ではここで起こします")
+        return True
+    if not gateway_loaded():
+        ok, out = run(["launchctl", "bootstrap", f"gui/{os.getuid()}", PLIST], timeout=120)
+        if not ok and "already" not in out.lower():
+            say(NG, "登録できませんでした", out[-200:])
+            return False
+    run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{GATEWAY}"], timeout=120)
+    print("  … 起動を待つ", end="", flush=True)
+    for _ in range(90):
+        if port_open():
+            print()
+            say(OK, "立ちました", f"ポート {GATEWAY_PORT}")
+            return True
+        print(".", end="", flush=True)
+        time.sleep(1)
+    print()
+    say(NG, "90秒待っても立ちませんでした")
+    why = last_startup_failure()
+    if why:
+        print(f"     直近の起動失敗: {why}")
+    return False
+
+
+def step_check():
+    """11. つながったか見る。**ここは合格判定ではない。**"""
+    step(11, "つながったか見る")
+    if CHECK:
+        say(WARN, "本番ではここで health を見ます")
+        return True
+    ok, out = run(["openclaw", "health"], timeout=120)
+    rows = [l.strip() for l in out.splitlines()
+            if l.startswith(("Discord:", "LINE:", "Gateway event loop:"))]
+    for row in rows:
+        say(OK if "error" not in row.lower() else WARN, row)
+    if not rows:
+        say(WARN, "health に受け口の行が出ません")
+    return True
+
+
+def finish(done):
+    """印を外し、人がやることを出す。"""
+    if not CHECK:
+        maintenance_clear()
+    print()
+    if not done:
+        print(f"  {NG} 途中で止まりました。上に理由が出ています。")
+        print("     退避してあるので、やり直せます。")
+        print("     もう一度: openclaw-update --recover")
+        return 1
+    if CHECK:
+        print(f"  {OK} 予告はここまでです。実行するなら --check を外してください。")
+        return 0
+    print(f"  {OK} ここまで通りました。\033[1mただし、まだ合格ではありません。\033[0m")
+    print()
+    print("  最後の1つは人がやること:")
+    print("    Discord の #agent で、書き換えの起きない用事を1つ頼む。")
+    print("      例）READMEの1行目を教えて。何も書き換えないで。")
+    print()
+    print("    ① すぐ「取りかかります」と返るか")
+    print("    ② 数十秒〜数分後に結果が届くか")
+    print("    ③ ~/.openclaw/qwc-async.log に開始と完了の2行が増えるか")
+    print()
+    print("  health がつながったと言っても、それは受け口が立ったまで。")
+    print("  この家のシステムは落ちずに黙るので、往復1回だけが合否になる。")
+    print()
+    print("  往復できたら:  config-guard --save   ← いまの形を「動いた形」にする")
+    return 0
+
+
+def main():
+    mode = "予告" if CHECK else ("復旧" if RECOVER else "更新")
+    print(f"\033[1mopenclaw-update（{mode}）\033[0m")
+    why = last_startup_failure()
+    if why and not port_open():
+        print(f"  直近の起動失敗: {why}")
+
+    steps = [step_hold, step_stop, step_backup, step_upgrade, step_restore,
+             step_preview, step_migrate, step_verify_ctx, step_plugins,
+             step_start, step_check]
+    try:
+        for fn in steps:
+            if not fn():
+                return finish(False)
+    except KeyboardInterrupt:
+        print()
+        say(NG, "止めました")
+        return finish(False)
+    finally:
+        if not CHECK:
+            maintenance_clear()
+    return finish(True)
+
+
+if __name__ == "__main__":
+    if set(sys.argv[1:]) & {"-h", "--help", "help"}:
+        print(__doc__.strip())
+        sys.exit(0)
+    sys.exit(G.run(main))

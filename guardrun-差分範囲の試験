@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""残存・削除・無操作を対照に、差分対象外を消失と断定しないことを確かめる。"""
+import importlib.util
+import json
+from pathlib import Path
+import os
+import tempfile
+
+spec = importlib.util.spec_from_file_location('guardrun', Path(__file__).with_name('guardrun.py'))
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+results = []
+for case in ('distに残す', 'buildに残す', '書いて消す', '時刻だけ変える', '無操作'):
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # 時刻の解像度に依存せず、無操作と更新の対照を作る。
+        os.utime(root, ns=(1_000_000_000, 1_000_000_000))
+        before = g.snapshot(td)
+        timestamp = g._触った跡(td)
+        if case.endswith('に残す'):
+            target = root / case.removesuffix('に残す')
+            target.mkdir()
+            (target / 'result.txt').write_text('remaining\n')
+        elif case == '書いて消す':
+            target = root / 'gone.txt'
+            target.write_text('temporary\n')
+            target.unlink()
+        elif case == '時刻だけ変える':
+            os.utime(root, None)
+        delta = g.diff(before, g.snapshot(td))
+        touched = g._触った跡(td) > timestamp
+        reason = g._差分なしの理由(touched)
+        remaining = len([p for p in root.rglob('*') if p.is_file()])
+        ok = (g.verdict(delta)[0] == '青'
+              and touched == (case != '無操作')
+              and remaining == (1 if case.endswith('に残す') else 0)
+              and '未判定' in reason
+              and '書いたのに残っていない' not in reason)
+        results.append(dict(case=case, remaining=remaining, touched=touched, reason=reason, passed=ok))
+print(json.dumps(results, ensure_ascii=False, indent=2))
+raise SystemExit(0 if all(r['passed'] for r in results) else 1)

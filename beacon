@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""beacon — この家が生きていることを、家の外に置く。
+
+## なぜ要るか
+
+点呼（`silence.py`）は、**この機械が動いていれば**黙りを全部拾う。
+拾えないのは1つだけ——**機械ごと落ちたとき**。そのとき中の誰も
+気づけないし、気づいても知らせる手段が無い。**中からは作れない。**
+
+だから外に印を1つ置いて、**外の者がその古さを見る**。
+ここは「押す」側だけで、**判断は外がする**（外の判断を中に持つと、
+機械が死んだ瞬間に判断も一緒に死ぬ）。
+
+## 何が外に出るか（全部）
+
+    at        押した時刻（ISO・秒まで）
+    点呼      家じゅうの定期的なものの本数
+    鳴っている そのうち引っかかっている本数
+
+**それだけ。**名前もパスもホスト名も出さない。
+この家の芯は「逃げ道が無いこと」なので、外に出す量は
+**数えられるほど少なく**保つ。増やすときは、ここの一覧も一緒に増やす。
+
+置き場は秘密 gist（URL を知っている者だけが読める）。
+gist の ID は `~/.openclaw/.env` の `BEACON_GIST` にある——
+**ここに直書きしない。**この一式を公開したときに、自分を指す ID が出る。
+
+## 外の見張り
+
+claude.ai の routine（1時間ごと・Anthropic のクラウドで走る）が
+この gist を読み、古ければ知らせる。**中の見張りとは別の機械で動く**ので、
+この Mac が落ちても生き残る。
+
+    beacon          1回押す
+    beacon --show   いま外に何が置いてあるか読む
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, OPENCLAW, atomic_write, env_value, maintenance  # noqa: E402
+
+G = Guard("beacon")
+# **`--show` は読むだけ。**鍵を取ると、定時の回とぶつかって
+# 「もう1つ走っている」で押せなくなる（2026-09-13、作った直後に踏んだ）。
+# 見張りごとに「手を出す呼び方」は違うので、共有側の既定をここで足す。
+G.LOOK_ONLY = G.LOOK_ONLY | {"--show"}
+GH = "/opt/homebrew/bin/gh"
+# **押せた跡は、心拍とは別に残す。**
+# 心拍（`Guard.run` が必ず書く）は「走った」までしか言わない。
+# 2026-09-14、外の印が1時間39分止まっているのに、点呼は「押せている」と言った——
+# 心拍を見ていたからで、**本人の自己申告を結果として読んでいた**。
+# ここに書くのは**実際に外へ置けたときだけ**。
+押せた跡 = os.path.join(OPENCLAW, "beacon-pushed.json")
+FILE = "house-beacon.json"
+
+
+def gist_id():
+    return env_value("BEACON_GIST")
+
+
+def 中身():
+    """外に出す3つ。**ここに項目を足すときは、冒頭の一覧も足すこと。**"""
+    # **時差を付ける。**外の見張りは UTC のクラウドで走るので、
+    # `2026-09-13T11:24:08` だけ渡すと9時間ずれる。読む側に時差を推測させない。
+    d = {"at": datetime.now().astimezone().isoformat(timespec="seconds"),
+         "点呼": 0, "鳴っている": 0}
+    try:
+        import silence
+        所見, _ = silence.点呼()
+        d["点呼"] = len(所見)
+        d["鳴っている"] = sum(1 for s in 所見 if s["判定"] in silence.鳴る判定)
+    except Exception:
+        # 点呼が読めなくても押す。**押せることと、家が無事なことは別。**
+        # ここで諦めると、点呼が壊れた日に外からは「機械が死んだ」に見える。
+        d["点呼"] = -1
+    return d
+
+
+def 押す(dry=False):
+    gid = gist_id()
+    if not gid:
+        return False, "BEACON_GIST が ~/.openclaw/.env に無い"
+    body = json.dumps(中身(), ensure_ascii=False) + "\n"
+    if dry:
+        return True, body.strip()
+    tmp = os.path.join("/tmp", FILE)
+    try:
+        with open(tmp, "w") as f:
+            f.write(body)
+        r = subprocess.run([GH, "gist", "edit", gid, "-f", FILE, tmp],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"押せなかった（{type(e).__name__}）"
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if r.returncode != 0:
+        return False, f"押せなかった: {(r.stderr or r.stdout).strip()[:120]}"
+    try:
+        atomic_write(押せた跡, json.dumps(
+            {"at": datetime.now().astimezone().isoformat(timespec="seconds")},
+            ensure_ascii=False))
+    except OSError:
+        pass
+    return True, body.strip()
+
+
+def 読む():
+    """外に置いてあるものを読み返す。**押したつもりを、押した証拠にしない。**"""
+    gid = gist_id()
+    if not gid:
+        return None
+    try:
+        r = subprocess.run([GH, "gist", "view", gid, "-f", FILE, "--raw"],
+                           capture_output=True, text=True, timeout=120)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def main():
+    if "--show" in sys.argv:
+        d = 読む()
+        print(json.dumps(d, ensure_ascii=False) if d else "外に読めるものが無い")
+        return 0 if d else 1
+    if "--dry-run" in sys.argv:
+        ok, msg = 押す(dry=True)
+        print(msg)
+        return 0 if ok else 1
+
+    # **手入れ中でも押す。**印は「手を出すな」であって「死んだふりをしろ」ではない。
+    # ここで黙ると、手入れのたびに外の見張りが「機械が落ちた」と鳴る。
+    手入れ中, _ = maintenance()
+    ok, msg = 押す()
+    if not ok:
+        G.log(f"押せなかった: {msg}")
+        print(msg, file=sys.stderr)
+        return 1
+    if "--quiet" not in sys.argv:
+        print(msg + ("（手入れ中）" if 手入れ中 else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

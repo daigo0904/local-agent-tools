@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+pc-check — PC の状態を見て、気をつけた方がいいことだけ知らせる。
+
+毎日走らせても普段は黙る。何か引っかかったときだけ Discord に送る。
+見るもの:
+  - ディスクの空き（少ないと作業が止まる）
+  - 大きいファイル（容量を食っている犯人）
+  - AI環境のバックアップが古くないか
+  - 常駐サービスが落ちていないか
+
+    pc-check           問題があれば通知（何もなければ黙る）
+    pc-check --report  問題が無くても状態を表示する
+"""
+
+import json
+import os
+import sqlite3
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, maintenance  # noqa: E402
+
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+
+def env_value(key):
+    """環境変数、無ければ ~/.openclaw/.env から拾う。
+
+    ここに直書きしない。この一式を公開したときに、
+    自分を指すID（永久に変えられない）が出てしまうため。"""
+    v = os.environ.get(key)
+    if v:
+        return v.strip()
+    try:
+        for row in open(ENV_FILE):
+            row = row.strip()
+            if row.startswith(f"{key}="):
+                return row.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+DISCORD_CHANNEL_ID = env_value("DISCORD_CHANNEL_ID")
+BACKUP_DIR = os.path.expanduser("~/バックアップ")
+
+DISK_WARN_PERCENT = 15      # 空きがこれ未満なら警告
+BIG_FILE_GB = 2.0           # これより大きいファイルを報告
+BACKUP_STALE_DAYS = 3       # バックアップがこれ以上古いと警告
+SERVICES = [
+    "ai.openclaw.gateway",
+    "ai.openclaw.line-tunnel",
+    "ai.openclaw.line-proxy",
+    "ai.openclaw.line-sync",
+]
+
+
+def load_token():
+    t = os.environ.get("DISCORD_BOT_TOKEN")
+    if t:
+        return t
+    try:
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line.startswith("DISCORD_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def notify(text):
+    tok = load_token()
+    if not tok:
+        print(text)
+        return
+    body = json.dumps({"content": text[:1950]}).encode()
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bot {tok}",
+                 "User-Agent": "pc-check (local, 1.0)"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        pass
+
+
+def check_disk():
+    total, used, free = shutil.disk_usage(os.path.expanduser("~"))
+    pct = free / total * 100
+    line = f"ディスクの空きは {free/1024**3:.0f}GB（全体の{pct:.0f}%）"
+    return (pct < DISK_WARN_PERCENT), line
+
+
+def check_big_files():
+    """ホーム直下の主要な場所だけ見る。全体走査はしない（時間がかかるため）。"""
+    targets = [os.path.expanduser(p) for p in
+               ("~/Downloads", "~/Desktop", "~/Documents", "~/Movies")]
+    big = []
+    for base in targets:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and not d.endswith(".app")]
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    sz = os.path.getsize(p)
+                except OSError:
+                    continue
+                if sz >= BIG_FILE_GB * 1024**3:
+                    big.append((sz, p))
+    big.sort(reverse=True)
+    return big[:5]
+
+
+# 控えは2種類ある。**それぞれ別に見ること。**
+# 片方だけ古くなる壊れ方が実際に起きた（2026-09-08 に発覚）。
+KINDS = [
+    ("openclaw-backup", "設定と会話履歴"),
+    ("ai-env-", "Obsidian・スクリプト・workspace"),
+]
+
+
+def check_backup():
+    """控えが古くなっていないか。**種類ごとに見る。**
+
+    以前は置き場でいちばん新しいファイル1つだけを見ていた。
+    2026-09-08、**設定と履歴の控えが2日ぶん失敗し続けていたのに**、
+    小さいほうが毎日成功するので「最後のバックアップは0日前」と出ていた。
+    いちばん新しい1つを見る判定は、**種類が2つある時点で必ず嘘をつく**。"""
+    if not os.path.isdir(BACKUP_DIR):
+        return True, "AI環境のバックアップがまだありません"
+    files = [os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR)
+             if os.path.isfile(os.path.join(BACKUP_DIR, f))]
+    if not files:
+        return True, "AI環境のバックアップがまだありません"
+
+    bad, parts = False, []
+    for key, label in KINDS:
+        mine = [f for f in files if key in os.path.basename(f)]
+        if not mine:
+            bad = True
+            parts.append(f"{label}: 一度も取れていない")
+            continue
+        age = (time.time() - os.path.getmtime(max(mine, key=os.path.getmtime))) / 86400
+        if age > BACKUP_STALE_DAYS:
+            bad = True
+            parts.append(f"{label}: {age:.0f}日前（古い）")
+        else:
+            parts.append(f"{label}: {age:.0f}日前")
+    return bad, "バックアップ … " + " ／ ".join(parts)
+
+
+def check_services():
+    import schedlib
+    登録 = schedlib.PID一覧(接頭=None)
+    if not 登録:
+        return [], "常駐サービスの状態を確認できませんでした（%s）" % (
+            schedlib.仕組み() or "常駐・定時の仕組みが無い")
+    dead = [s for s in SERVICES if s not in 登録]
+    return dead, f"常駐サービス {len(SERVICES)-len(dead)}/{len(SERVICES)} が稼働中"
+
+
+# 定時の仕事の失敗を、何時間ぶん見るか
+CRON_WINDOW_HOURS = 24
+
+# 記録の置き場。gateway が書く。
+CRON_DB = os.path.expanduser("~/.openclaw/state/openclaw.sqlite")
+
+
+def check_rollcall():
+    """家じゅうの定期的なものを1回読む。**台帳は launchd と gateway から生える。**
+
+    読めなければ黙らない。**点呼が死ぬことと家が無事なことは別。**"""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import silence
+    except Exception as e:
+        return [f"点呼が読めない（{type(e).__name__}: {e}）"], None
+    try:
+        # **覚えは書かない。**watchdog の「起きていた時計」を進めてしまう。
+        所見, _ = silence.点呼(自分="ai.openclaw.pc-check")
+    except Exception as e:
+        return [f"点呼が走らない（{type(e).__name__}: {e}）"], None
+    # **外の証人が無いことは、毎朝は知らせない。**
+    # 消し方は1つ（実際に外に置く）で、それは手の仕事。毎日同じことを
+    # 蒸し返すと、この知らせ全体が読まれなくなる。**見せはする。**
+    鳴 = [x for x in 所見 if x["判定"] in silence.鳴る判定 and x["鍵"] != "外の証人"]
+    外 = next((x for x in 所見 if x["鍵"] == "外の証人"), None)
+    ひとこと = f"点呼 {len(所見) - 1} 本" + ("すべてそろっている" if not 鳴 else "")
+    if 外:
+        ひとこと += f"／{外['名前']}: {外['説明']}"
+    return [f"{x['名前']}: {x['判定']} — {x['説明']}" for x in 鳴], ひとこと
+
+
+def check_cron():
+    """定時の仕事が失敗していないか。
+
+    ■ なぜ要るか
+      定時の仕事（朝の便り・SNSの下書き・見回り）は gateway の中で走り、
+      成否は sqlite に残る。**残るだけで、誰も見ていない。**
+      2026-09-10 に調べたら、9/7 に sns-draft が4回続けて600秒で打ち切られ、
+      heartbeat が59回中5回失敗していた。どれも人には届いていなかった。
+
+    ■ 見るのは直近1日だけ
+      記録は100件で巻き取られる（古いものから消える）ので、
+      それより長い窓を取っても正しく数えられない。
+
+    ■ 読めなければ黙る
+      DB が無い・壊れている・gateway が書き込み中で読めない、はいずれも
+      「失敗した」ではない。**確かめられなかったことを、異常として伝えない。**
+    """
+    if not os.path.exists(CRON_DB):
+        return [], None
+    try:
+        con = sqlite3.connect(f"file:{CRON_DB}?mode=ro", uri=True, timeout=3)
+        names = {r[0]: r[1] for r in con.execute("select job_id, name from cron_jobs")}
+        cutoff = (time.time() - CRON_WINDOW_HOURS * 3600) * 1000
+        rows = list(con.execute(
+            "select job_id, status, started_at_ms, error_text from cron_run_receipts "
+            "where started_at_ms >= ? order by started_at_ms", (cutoff,)))
+        con.close()
+    except Exception:
+        return [], None
+
+    if not rows:
+        return [], None
+
+    bad = {}
+    total = {}
+    last = {}
+    skipped = 0
+    for job, status, started, err in rows:
+        name = names.get(job, (job or "?")[:8])
+        total[name] = total.get(name, 0) + 1
+        last[name] = status                      # rows は時刻順なので、最後に入るのが直近
+        # **見送りは失敗ではない。**
+        # 2026-09-11、心拍に activeHours（07:00-23:00）を入れた翌日、
+        # 深夜の `skipped: quiet-hours` 16回がそのまま失敗に化けて
+        # 「20/51 回 失敗」と知らせが出た。**黙るように作った仕組みが、
+        # 黙ったことを故障として報告していた。** 見送りは決定であって故障ではない。
+        # ただし見えなくはしない（下のまとめに回数を出す）。
+        if status == "skipped":
+            skipped += 1
+            continue
+        if status != "ok":
+            bad.setdefault(name, []).append((status, (err or "").strip()))
+
+    # **自力で戻ったものは知らせない。**
+    # 直近が成功しているなら、途中の失敗はもう終わった話で、
+    # それを毎朝蒸し返すと知らせが信用されなくなる。
+    # 実際 heartbeat は 49回中6回こけるが、毎回すぐ戻っていた。
+    bad = {n: f for n, f in bad.items() if last.get(n) != "ok"}
+
+    if not bad:
+        tail = f"・見送り{skipped}回" if skipped else ""
+        return [], (f"定時の仕事 {len(rows) - skipped} 回すべて成功{tail}"
+                    f"（直近{CRON_WINDOW_HOURS}時間）")
+
+    lines = []
+    for name, fails in sorted(bad.items(), key=lambda x: -len(x[1])):
+        status, err = fails[0]
+        detail = err[:60] if err else status
+        lines.append(f"{name}: {len(fails)}/{total[name]} 回 失敗（{detail}）")
+    return lines, None
+
+
+def main():
+    report = "--report" in sys.argv
+
+    # 走ったことを残す。**普段は黙る作りなので、成功時に何の跡も残らない。**
+    # 「静かに成功した」と「動いていない」が外から区別できず、
+    # 2026-09-10 の点検で実際に見分けがつかなかった。
+    try:
+        Guard("pc-check").beat()
+    except Exception:
+        pass  # 心拍が書けなくても、点検そのものは続ける
+
+    # 手入れ中は、常駐サービスが**わざと止まっている**。そのまま数えると
+    # 「止まっているサービスがあります」と誤報になる。
+    # 人が --report で聞いたときは調べて見せる（知らせだけ送らない）。
+    held, why = maintenance()
+    if held and not report:
+        print(f"手入れ中なので見送りました（{why}）")
+        return 0
+
+    problems, info = [], []
+
+    bad, line = check_disk()
+    (problems if bad else info).append(line)
+
+    big = check_big_files()
+    if big:
+        msg = "容量を食っているファイル:\n" + "\n".join(
+            f"  {sz/1024**3:.1f}GB  {os.path.basename(p)}" for sz, p in big)
+        info.append(msg)
+
+    bad, line = check_backup()
+    (problems if bad else info).append(line)
+
+    dead, line = check_services()
+    if dead:
+        problems.append("止まっている常駐サービス: " + ", ".join(dead))
+    else:
+        info.append(line)
+
+    # **点呼の2人目の読み手。**watchdog が毎分読んでいるが、watchdog が
+    # 死んだ日には点呼ごと消える。1日1回でも別のプロセスが同じ台帳を読めば、
+    # 「点呼そのものが黙った」に気づける。**知らせは重ねない**——watchdog が
+    # 変化したときだけ送るので、こちらは人が聞いたときに見せるだけ。
+    rc_bad, rc_ok = check_rollcall()
+    if rc_bad:
+        problems.append("点呼:\n" + "\n".join(f"  {c}" for c in rc_bad))
+    if rc_ok:
+        info.append(rc_ok)
+
+    cron_bad, cron_ok = check_cron()
+    if cron_bad:
+        problems.append("失敗した定時の仕事:\n" + "\n".join(f"  {c}" for c in cron_bad))
+    elif cron_ok:
+        info.append(cron_ok)
+
+    if problems:
+        text = "PCの状態で気になる点があります\n\n" + "\n".join(f"・{p}" for p in problems)
+        if big:
+            text += "\n\n容量を食っているファイル:\n" + "\n".join(
+                f"  {sz/1024**3:.1f}GB  {os.path.basename(p)}" for sz, p in big)
+        if held:
+            # ここへ来るのは `--report` で人が聞いたときだけ。
+            # 手入れ中の「止まっている」は、たいてい手入れそのものが理由なので、
+            # 見せはするが知らせは送らない。
+            print("（手入れ中なので知らせは送りません。下は手入れの影響かもしれません）")
+        else:
+            notify(text)
+        print(text)
+        # 人が `--report` で聞いたときは、無事だったぶんも見せる。
+        # 気になる点だけ出すと、ディスクや控えがどうなっているかが隠れて、
+        # 「聞いたのに一部しか分からない」ことになる。知らせ（notify）は今までどおり問題だけ。
+        if report and info:
+            print()
+            for i in info:
+                print(f"・{i}")
+        return 0
+
+    if report:
+        today = datetime.now().strftime("%-m月%-d日")
+        print(f"{today}のPCの状態は良好です\n")
+        for i in info:
+            print(f"・{i}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""guard-drill の各項目が、**守っている当のものを壊したときに落ちるか**を確かめる。
+
+## なぜ要るか
+
+2026-09-13、ピアが実測で見せた: loop-guard の門を殺しても、別の門が代わりに拾って
+**訓練は通ってしまう**。つまり「訓練が通った」は「見張りが効いている」を意味しない。
+2026-09-14 に数えたら、壊し試験まで持っている項目は **25 中 6** だった。
+
+## 何をするか
+
+項目ごとに、それが試している見張りを **何もしない版**（黙って exit 0）に差し替え、
+`guard-drill <項目>` を走らせて **落ちること**を確かめる。落ちなければ、
+その項目は見張りが死んでいても緑を出す＝**空の試験**である。
+
+## 嘘をつかないための3つ
+
+1. **対照を先に走らせる。** 壊す前に通ることを見せる。もともと落ちている項目に
+   壊し試験を当てても何も分からない。
+2. **差し替えが実際に呼ばれたかを見る。** 何もしない版は呼ばれるたびに跡を書く。
+   跡が無いのに「通った」を「空の試験」と読むと、**試せていないものを
+   「効いていない」と誤報する**（BIN 経由で呼んでいない項目がある）。
+3. **落ちたのを「素通り」と読まない。** 例外や異常終了は捕まえた側に数える
+   （2026-09-14、ピアがこの形で30分溶かした）。
+
+## 使い方
+
+    guard-drill-mutants            全部（重いものを除く）
+    guard-drill-mutants pulse …    項目を指定
+    guard-drill-mutants --list     何をどう壊すか見る
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+BIN = os.path.expanduser("~/bin")
+DRILL = os.path.join(BIN, "guard-drill")
+
+# ── 項目 → その項目が試している見張り ──────────────────────────
+#
+# **この表は静的に読んだだけの見立てで、証拠ではない。**
+# だから差し替えが実際に呼ばれたかを毎回見る（呼ばれなければ「試せない」と書く）。
+# guardlib.py は全員が import する共有部品なので差し替えない（家ごと止まる）。
+対象 = {
+    "pulse":    ["model-guard", "watchdog"],
+    "standoff": ["model-guard", "watchdog"],
+    "interval": ["model-guard", "watchdog"],
+    "notify":   ["notify"],
+    "lock":     ["watchdog"],
+    "qwc":      ["qwc-guard"],
+    "ollama":   ["model-guard"],
+    "gateway":  ["watchdog"],
+    "thrash":   ["model-guard"],
+    "busy":     ["qwc-guard", "model-guard"],
+    "silence":  ["watchdog", "silence.py"],
+    "walled":   ["qwc"],
+    "silent":   ["guardrun-sweep"],
+    "rewrite":  ["config-guard"],
+    "beacon":   ["beacon"],
+    "budget":   ["notify"],
+    "miscopy":  ["house-brief"],
+    "escape":   ["guardrun.py"],
+    "limits":   ["guardrun.py"],
+    # すでに壊し試験を持っている6項目。枠が動いてから最後に移す（ピアとの取り決め）
+    "spin":     ["loop-guard"],
+    "keep":     ["config-guard"],
+    "heal":     ["self-heal"],
+    "claim":    ["house-brief"],
+    "config":   ["config-guard"],
+    "guardlib": [],          # 共有部品。差し替えない
+}
+
+何もしない版 = '''#!/usr/bin/env python3
+# 壊し試験のための「何もしない版」。呼ばれた跡だけ残して、黙って正常終了する。
+import os, sys, time
+try:
+    with open(os.environ.get("MUTANT_LOG", "/dev/null"), "a") as f:
+        f.write("%.0f %s\\n" % (time.time(), " ".join(sys.argv)))
+except OSError:
+    pass
+sys.exit(0)
+'''
+
+
+def 走らない理由():
+    """走った跡が無いとき、**なぜ走らなかったのかを名指しする。**
+
+    2026-09-14、この枠の言い分が「claw hold が置かれている？」だけだったため、
+    読んだ人が印を確かめ、置かれていなくて行き止まった。実際は別の guard-drill が
+    鍵を握っていた（こちらが枠を流していた）。**走らない理由は少なくとも3つある。**
+
+        手入れの印   claw hold
+        鍵           ほかの guard-drill が走っている
+        見送り       訓練が自分で見送った
+
+この家には「警報に原因・確認方法・直し方を全部書いてあったので10分で特定できた」
+という実績がある（2026-09-10 の model-guard）。**片方だけ名指ししない。**
+"""
+    理由 = []
+    印 = os.path.expanduser("~/.openclaw/maintenance")
+    try:
+        with open(印) as f:
+            d = json.load(f)
+        残り = float(d.get("until", 0)) - time.time()
+        if 残り > 0:
+            理由.append("手入れの印（%s・あと %d 分）" % (d.get("by", "?"), 残り / 60))
+    except (OSError, ValueError, TypeError):
+        pass
+    鍵 = os.path.expanduser("~/.openclaw/guard-drill.lock")
+    try:
+        p = subprocess.run(["lsof", "-t", 鍵], capture_output=True,
+                           text=True, timeout=20, stdin=subprocess.DEVNULL)
+        for pid in (p.stdout or "").split():
+            q = subprocess.run(["ps", "-o", "command=", "-p", pid],
+                               capture_output=True, text=True, timeout=10,
+                               stdin=subprocess.DEVNULL)
+            命令 = " ".join((q.stdout or "").split())
+            # **python の長い道ではなく、走っている中身を見せる。**
+            # 先頭70字だと interpreter の道で埋まって、誰が握っているのか分からない。
+            i = 命令.find("guard-drill")
+            見せる = 命令[i:i + 70] if i >= 0 else 命令[-70:]
+            理由.append("鍵を握っている PID %s（%s）" % (pid, 見せる))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not 理由:
+        return ("理由が分からない。確かめ方: claw hold ／ "
+                "lsof ~/.openclaw/guard-drill.lock ／ 訓練の出力に『見送り』が無いか")
+    return "／".join(理由)
+
+
+def 走らせる(項目, binpath=None, log=None, 制限=420):
+    """guard-drill を1項目だけ走らせる。→ (通ったか, 終了コード, 出力)"""
+    env = dict(os.environ)
+    if binpath:
+        env["GUARD_DRILL_BIN"] = binpath
+        env["PATH"] = binpath + os.pathsep + env.get("PATH", "")
+    if log:
+        env["MUTANT_LOG"] = log
+    env["PYTHONDONTWRITEBYTECODE"] = "1"     # __pycache__ に古い版を残さない
+    try:
+        p = subprocess.run([sys.executable, "-B", DRILL, 項目],
+                           capture_output=True, text=True, timeout=制限,
+                           stdin=subprocess.DEVNULL, env=env)
+    except subprocess.TimeoutExpired:
+        return None, None, "（制限時間を超えた）"
+    出力 = (p.stdout or "") + (p.stderr or "")
+    # **異常終了は「捕まえた」側に数える。**素通りと読まない。
+    if p.returncode not in (0, 1):
+        return False, p.returncode, 出力
+    # **走っていないものを「通った」と読まない。**
+    # `claw hold` が置いてあると訓練は何もせずに帰る。終了コードは 0 なので、
+    # 判定だけ見ると全項目が緑に見える（2026-09-14、この枠の最初の実行で踏んだ）。
+    # 走った証拠（項目ごとの判定行）が無ければ、通ったとも落ちたとも言わない。
+    if "項目すべて通りました" not in 出力 and "✗" not in 出力 and "落ち" not in 出力:
+        return None, p.returncode, 出力 + "\n（走った跡が無い）"
+    return p.returncode == 0, p.returncode, 出力
+
+
+def 写しを作る(壊す名):
+    """~/bin の写し（symlink）を作り、指定の1本だけ「何もしない版」にする。"""
+    d = tempfile.mkdtemp(prefix="mutant-bin-")
+    for 名 in os.listdir(BIN):
+        元 = os.path.join(BIN, 名)
+        先 = os.path.join(d, 名)
+        if 名 == 壊す名:
+            continue
+        try:
+            os.symlink(元, 先)
+        except OSError:
+            pass
+    偽 = os.path.join(d, 壊す名)
+    with open(偽, "w") as f:
+        f.write(何もしない版)
+    os.chmod(偽, 0o755)
+    return d
+
+
+def 一件(項目, 見張り):
+    log = tempfile.mktemp(prefix="mutant-log-")
+    d = 写しを作る(見張り)
+    try:
+        通った, code, 出力 = 走らせる(項目, d, log)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    呼ばれた = os.path.exists(log) and os.path.getsize(log) > 0
+    try:
+        os.remove(log)
+    except OSError:
+        pass
+    if 通った is None:
+        return "×", "壊した状態で時間切れ（試せていない）"
+    if not 呼ばれた:
+        return "－", f"{見張り} を呼んでいない（この壊し方では試せない）"
+    if 通った:
+        return "★", f"{見張り} を何もしない版にしても通った（空の試験）"
+    return "○", f"{見張り} を壊したら落ちた"
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if "--list" in sys.argv[1:]:
+        for 項目, 見張りたち in 対象.items():
+            print(f"  {項目:10} {'／'.join(見張りたち) or '（差し替えない）'}")
+        return 0
+    重い = {"ollama", "gateway", "config"}
+    項目たち = args or [k for k in 対象 if k not in 重い]
+    結果 = {}
+    for 項目 in 項目たち:
+        見張りたち = 対象.get(項目) or []
+        if not 見張りたち:
+            print(f"  －  {項目:10} 差し替える見張りが無い")
+            結果[項目] = ("－", "差し替えない")
+            continue
+        # **対照を先に。** 壊す前に通らないなら、壊し試験にならない。
+        t0 = time.time()
+        通った, code, 出力 = 走らせる(項目)
+        if 通った is None:
+            なぜ = ("走った跡が無い ← " + 走らない理由()
+                    if "走った跡が無い" in 出力 else "時間切れ")
+            print(f"  ×  {項目:10} 対照が判定できない: {なぜ}（{time.time()-t0:.0f}秒）")
+            結果[項目] = ("×", f"対照が判定できない（{なぜ}）")
+            continue
+        if not 通った:
+            最後 = [l for l in 出力.strip().splitlines() if l.strip()]
+            print(f"  ×  {項目:10} 対照が落ちている: {最後[-1][:70] if 最後 else ''}")
+            結果[項目] = ("×", "対照が落ちている")
+            continue
+        印, 言い分 = "○", ""
+        for 見張り in 見張りたち:
+            印, 言い分 = 一件(項目, 見張り)
+            if 印 == "○":        # 1つでも落ちれば、その項目は空ではない
+                break
+        print(f"  {印}  {項目:10} {言い分}（{time.time()-t0:.0f}秒）")
+        結果[項目] = (印, 言い分)
+    效 = sum(1 for v in 結果.values() if v[0] == "○")
+    空 = [k for k, v in 結果.items() if v[0] == "★"]
+    他 = [k for k, v in 結果.items() if v[0] in ("－", "×")]
+    print(f"\n壊したら落ちた: {效} / {len(結果)}")
+    if 空:
+        print("空の試験（壊れているのに通る）: " + " ".join(空))
+    if 他:
+        print("試せなかった: " + " ".join(他))
+    return 0 if not 空 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

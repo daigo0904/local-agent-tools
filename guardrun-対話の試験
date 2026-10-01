@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""guardrun-対話の試験 — 対話モードで Ctrl-C / Ctrl-Z が壁の中の命令に届くか（pty で端末を作って送る）。
+
+    guardrun-対話の試験 [guardrun.py の場所]     Ctrl-C と Ctrl-Z を試し、どちらか届かなければ終了コード 1
+
+2026-09-24（M7）。子は setsid で端末から切り離され、見届け役は SIGINT/SIGTSTP を無視していたので、
+Ctrl-C は guardrun だけを 0.4 秒で落とし（受領証なし・命令は置き去り）、Ctrl-Z は命令に届かず走り切った。
+sudo は SIGINT/SIGTSTP を中継しない（実測）ので、guardrun は見届け役を直に探して（別 uid ならその uid として）送る。
+**測れていないこと:** 本物のシェルで Ctrl-Z → fg と戻すジョブ制御の一連（pty の子は孤立した組になるため）。
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pty
+import shutil
+import sys
+import tempfile
+import time
+
+GUARDRUN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/bin/guardrun.py")
+命令 = ("import signal,time,os\n"
+        "def h(n,f): open('受けた-%d'%n,'w').write('x'); os._exit(0)\n"
+        "signal.signal(signal.SIGINT,h); signal.signal(signal.SIGTSTP,h)\n"
+        "open('始めた','w').write('x')\n"
+        "time.sleep(20)\n")
+
+
+def 一回(鍵):
+    w = tempfile.mkdtemp(prefix="印の試験-対話-",
+                         dir="/Users/Shared" if os.path.isdir("/Users/Shared") else None)
+    os.chmod(w, 0o777)
+    pid, fd = pty.fork()
+    if pid == 0:
+        sys.path.insert(0, os.path.dirname(GUARDRUN))
+        spec = importlib.util.spec_from_loader(
+            "g", importlib.machinery.SourceFileLoader("g", GUARDRUN))
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        try:
+            r = g.run([sys.executable, "-c", 命令], w, prove=False, 対話=True, wall_sec=30)
+            書く = json.dumps({"判定": r["判定"], "終了": r["終了コード"]}, ensure_ascii=False)
+        except BaseException as e:                       # noqa: BLE001
+            書く = "guardrun が落ちた: %s" % type(e).__name__
+        with open(os.path.join(w, "受領証.txt"), "w") as f:
+            f.write(書く)
+        os._exit(0)
+    for _ in range(150):
+        if os.path.exists(os.path.join(w, "始めた")):
+            break
+        time.sleep(0.1)
+    time.sleep(0.5)
+    os.write(fd, b"\x03" if 鍵 == "C" else b"\x1a")
+    始 = time.time()
+    while time.time() - 始 < 40:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+            os.read(fd, 4096)
+        except OSError:
+            break
+        time.sleep(0.1)
+    受けた = [n for n in os.listdir(w) if n.startswith("受けた")]
+    受 = os.path.join(w, "受領証.txt")
+    受領証 = open(受).read() if os.path.exists(受) else "無い"
+    shutil.rmtree(w, ignore_errors=True)
+    if os.path.exists(w):
+        import subprocess
+        subprocess.run(["sudo", "-n", "-u", os.environ.get("GUARDRUN_USER", "_guardrun"),
+                        "/bin/rm", "-rf", w], capture_output=True)
+    ok = bool(受けた) and 受領証.startswith("{")
+    print("%s Ctrl-%s: 命令が受けた=%s 受領証=%s（%.1f秒）"
+          % ("○" if ok else "✗", 鍵, 受けた or "なし", 受領証, time.time() - 始), flush=True)
+    return ok
+
+
+if __name__ == "__main__":
+    結果 = [一回("C"), 一回("Z")]
+    sys.exit(0 if all(結果) else 1)

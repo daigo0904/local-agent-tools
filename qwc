@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""qwc — 既定で壁の中で走らせる。逃げ道は `--壁なし`。
+
+    qwc                      対話。壁の中で動く
+    qwc -p "テストを直して"    一回だけ。壁の中で動く
+    qwc --依存 -p "…"         先に壁の外で npm install してから走らせる
+    qwc --作業場 <道> -p "…"   作業場を指定する
+    qwc --受領証              最近の受領証を並べる
+    qwc --壁なし …            **壁を通さない**（今までどおり）
+
+## なぜ既定を壁にするのか
+
+2026-09-14 まで、壁は11項目すべて通っていたのに**守っているものが0**だった。
+`guardrun-qwc` という別の入り口を用意しても、日常は `qwc` を打つので通らない。
+**選べる安全は、たいてい選ばれない。**だから既定を入れ替えて、
+逃げ道のほうに名前を付けた。
+
+## 壁の中と外で何が違うか
+
+    書ける   いまのフォルダと、qwc 自身の作業記録（~/.qwythos-code/sessions）だけ
+    読める   いまのフォルダと、qwc の設定。**家の他の場所は読めない**
+             （~/.ssh も ~/.qwythos-code/.env の Tavily 鍵も読めない）
+    出られる ollama だけ。ネットの調べものは壁の中からはできない
+    残るもの 受領証（~/.guardrun）。何を書き換えたかが差し引きで残る
+    始末     壁時計を過ぎたら、組を抜けた孫まで含めて止まる
+
+**確認を人に聞く代わりに、OS に聞いている。**だから `--yolo` は既定で付ける。
+
+## 逃げ道を残す理由
+
+壁の中で**できない仕事がまだある**：ネットを使う調べもの、npm が要る作業、
+家の他の場所を触る用事。そこで無理に壁を通すと、人は壁ごと捨てる。
+`--壁なし` を1語で打てるようにしておくほうが、結局は壁が生き残る。
+
+## 戻し方
+
+    ln -sf ~/コーディングCLI/bin/qwc.mjs ~/bin/qwc
+"""
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+本体 = os.path.expanduser("~/コーディングCLI/bin/qwc.mjs")
+記録の場所 = os.path.expanduser("~/.qwythos-code")
+
+
+def 受領証を並べる(数=10):
+    # **ここでも遅延 import。**guardrun が読めない機械でも `qwc --壁なし` は
+    # 打てるようにしておきたいので、上では読み込まない。
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import guardrun as g
+    for p in sorted(glob.glob(os.path.join(g.記録の根(), "runs", "*", "受領証.json")))[-数:]:
+        try:
+            r = json.load(open(p))
+        except Exception:
+            continue
+        変 = len(r.get("差分", {}).get("変更", []))
+        追 = len(r.get("差分", {}).get("追加", []))
+        print("  %-4s %s  変更%d 追加%d  %s"
+              % (r.get("判定"), r.get("id"), 変, 追, (r.get("作業場") or "")[-46:]))
+    return 0
+
+
+def 依存の状態(作業場):
+    """package.json の依存と node_modules の有無。→ (要る, 揃っている, 説明)"""
+    p = os.path.join(作業場, "package.json")
+    if not os.path.exists(p):
+        return False, True, "package.json が無い"
+    try:
+        d = json.load(open(p))
+    except Exception as e:
+        return False, True, "package.json が読めない（%s）" % type(e).__name__
+    要る = bool(d.get("dependencies") or d.get("devDependencies"))
+    ある = os.path.isdir(os.path.join(作業場, "node_modules"))
+    if not 要る:
+        return False, True, "依存なし"
+    return True, ある, ("node_modules がある" if ある else "node_modules が無い")
+
+
+def 依存を入れる(作業場):
+    """**壁の外で、人として** npm install を走らせる。
+
+    壁の中からは registry に出られない（実測 000）。中から出られる穴を
+    開ける案もあるが、**それは「壁の中から外に出られる走り」という例外**を
+    作り、例外は必ず増える。だから依存解決だけ外に出す。
+
+    **ここは壁の外である。**npm の install script は人の権限で走る。
+    それを承知で人が踏む一歩なので、黙ってやらずに毎回そう言う。"""
+    print("── 依存を入れます（**ここだけ壁の外・あなたの権限で走ります**）──")
+    print("   壁の中からは registry に出られないので、ここは人が踏む一歩です。")
+    ロック = os.path.exists(os.path.join(作業場, "package-lock.json"))
+    命令 = ["npm", "ci"] if ロック else ["npm", "install"]
+    前 = _量(作業場)
+    r = subprocess.run(命令, cwd=作業場)
+    後 = _量(作業場)
+    print("   %s → 終了コード %d（%.0fMB・%d ファイル増えた）"
+          % (" ".join(命令), r.returncode, (後[0] - 前[0]) / 1e6, 後[1] - 前[1]))
+    return r.returncode == 0
+
+
+def _量(道):
+    総, 数 = 0, 0
+    for d, _s, fs in os.walk(道):
+        for f in fs:
+            try:
+                総 += os.path.getsize(os.path.join(d, f))
+                数 += 1
+            except OSError:
+                pass
+    return 総, 数
+
+
+def 素で走る(引数):
+    """壁を通さない。**今までどおりの qwc。**"""
+    node = shutil.which("node") or "/opt/homebrew/bin/node"
+    os.execvp(node, [node, 本体] + 引数)
+
+
+def main():
+    引数 = sys.argv[1:]
+    if "--壁なし" in 引数 or os.environ.get("GUARDRUN_OFF") == "1":
+        素で走る([a for a in 引数 if a != "--壁なし"])
+    if "--受領証" in 引数:
+        return 受領証を並べる()
+    if 引数 and 引数[0] in ("-h", "--help", "--version", "-v"):
+        # 使い方や版の表示に壁は要らない（30秒の証明を待たせない）
+        素で走る(引数)
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import guardrun as g
+    except Exception as e:
+        print("guardrun が読めないので、壁なしで走ります: %s" % e, file=sys.stderr)
+        素で走る(引数)
+
+    作業場 = os.getcwd()
+    if "--作業場" in 引数:
+        i = 引数.index("--作業場")
+        作業場 = 引数[i + 1]
+        引数 = 引数[:i] + 引数[i + 2:]
+    # **家そのものや、その上を作業場にしない。**
+    # 作業場は「書いてよい場所」なので、ここが家だと契約が
+    # 「家じゅうに書いてよい」になる——壁を立てながら自分で開ける形。
+    危ない = {os.path.realpath(os.path.expanduser("~")), "/", "/Users",
+              "/Users/Shared", os.path.realpath("/tmp")}
+    if os.path.realpath(作業場) in 危ない:
+        print("ここを作業場にはできません: %s" % 作業場, file=sys.stderr)
+        print("作業場は「書いてよい場所」です。家の直下だと家じゅうに",
+              file=sys.stderr)
+        print("書ける契約になってしまうので、仕事のフォルダに降りてください。",
+              file=sys.stderr)
+        print("どうしても必要なら --壁なし（壁を通しません）。", file=sys.stderr)
+        return 2
+    # **ACL を付けられない場所がある。**`/var/folders/…`（macOS の
+    # 一時置き場）は持ち主でも `chmod +a` が Operation not permitted になる
+    # （SIP）。そこを作業場にすると壁に入れないので、先に言う。
+    実 = os.path.realpath(作業場)
+    if 実.startswith("/var/folders/") or 実.startswith("/private/var/folders/"):
+        print("ここは壁に入れません（macOS の一時置き場 /var/folders/… は"
+              " ACL を受け付けません）。", file=sys.stderr)
+        print("  /private/tmp の下か、ふつうの作業フォルダで打ってください。",
+              file=sys.stderr)
+        print("  どうしてもここでなら --壁なし。", file=sys.stderr)
+        return 2
+
+    要る, 揃った, なぜ = 依存の状態(作業場)
+    if "--依存" in 引数:
+        引数.remove("--依存")
+        if not 依存を入れる(作業場):
+            print("依存を入れられませんでした。壁の中には入れません。", file=sys.stderr)
+            return 2
+        print()
+    elif 要る and not 揃った:
+        print("この作業場は依存が要りますが %s。" % なぜ, file=sys.stderr)
+        print("壁の中からは registry に出られません。先に入れてください:",
+              file=sys.stderr)
+        print("    qwc --依存 %s" % " ".join(引数[:2]), file=sys.stderr)
+        return 2
+
+    node = shutil.which("node") or "/opt/homebrew/bin/node"
+    足す = []
+    if "--ctx" not in 引数:
+        足す += ["--ctx", "65536"]      # 別 uid では設定を読めないことがある
+    if not (set(引数) & {"--yolo", "--dangerously-skip-permissions",
+                          "--confirm", "--no-yolo"}):
+        足す += ["--yolo"]
+
+    # **できないことを先に言う。**壁の中から出られるのは ollama だけで、
+    # Tavily の鍵（~/.qwythos-code/.env）も秘密として塞いである。
+    # つまり web_search / web_fetch は**必ず失敗する**。
+    # 途中で失敗させて理由を探させるより、先に一行で言うほうが安い。
+    print("壁の中（出られるのは ollama だけ・調べものは --壁なし で）",
+          file=sys.stderr)
+    r = g.run([node, 本体] + 引数 + 足す, 作業場,
+              net_allow=["localhost:11434"],
+              # qwc 自身の作業記録だけは家の中に置かせる（--resume が要る）。
+              # **鍵のある ~/.qwythos-code/.env は含めない。**
+              extra_writes=[os.path.join(記録の場所, "sessions")],
+              extra_reads=[os.path.join(記録の場所, "config.json"),
+                           os.path.dirname(本体), os.path.dirname(os.path.dirname(本体))],
+              wall_sec=3600, 対話=True)
+
+    印 = {"緑": "●", "青": "○", "赤": "✗", "中断": "✗", "拒否": "✗", "失敗": "✗"}.get(r["判定"], "?")
+    print()
+    print("── 受領証 %s %s（%s 秒・証明は %s 秒前）" %
+          (印, r["判定"], r["秒"],
+           r.get("証明の古さ") if r.get("証明の古さ") is not None else "取った"))
+    for c in r["差分"]["変更"][:20]:
+        print("   変更 %s（%d行 → %d行）" % (c["path"], c["前"], c["後"]))
+    for a in r["差分"]["追加"][:20]:
+        print("   追加 %s（%d行）" % (a["path"], a["行"]))
+    for x in r["差分"]["削除"][:20]:
+        print("   削除 %s（%d行）" % (x["path"], x["行"]))
+    for y in (r.get("理由") or [])[:5]:
+        print("   ・%s" % y)
+    if r["壁に当たった"]:
+        print("   壁 %s" % r["壁に当たった"])
+    print("   %s" % r.get("受領証"))
+    # **終了コードは qwc 自身のものを返す。**
+    # ここを受領証の判定に置き換えたら、qwc を呼んでいる見張り
+    # （qwc-guard）が「qwc が壊れた」と誤診した（2026-09-14 に踏んだ）。
+    # 差し替えた道具が、呼ぶ側の約束を勝手に変えてはいけない。
+    # ただし**qwc が成功したのに受領証が赤いときだけ**は別で、
+    # 黙って 0 を返すと「壁が止めたのに成功に見える」ことになる。
+    子 = r.get("終了コード")
+    if 子 not in (0, None):
+        return 子 if 0 < 子 < 256 else 1
+    return 0 if r["判定"] in ("緑", "青") else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,147 @@
+#!/bin/sh
+# guardrun-crosstest — 別の OS で verify() を回して、移植の主張を測り直す。
+#
+# **移植の主張は、コードと同じ速さで腐る。**「Linux でも動く」は書いた日の
+# 事実でしかない。だから手で1回やって満足せず、いつでも同じ形で測れるように
+# しておく。中身は verify() そのものなので、**判定基準はこちらに持たない。**
+#
+# 3つの腕を回す:
+#   ① Linux + bwrap      壁が効く Linux
+#   ② Linux 道具なし      bwrap を取り上げた Linux（正直に劣化するか）
+#   ③ 実行中の機械        いまここ（macOS なら sandbox-exec）
+#
+# ①② には Docker が要る。**無いなら「測っていない」と言って終わる。**
+# 測れなかったことを「たぶん動く」に読み替えない。
+set -u
+GUARDRUN="${GUARDRUN:-$HOME/bin/guardrun.py}"
+IMG=guardrun-crosstest
+
+if [ ! -f "$GUARDRUN" ]; then
+  echo "guardrun.py が無い: $GUARDRUN" >&2; exit 2
+fi
+
+echo "③ いまの機械"
+python3 "$GUARDRUN" --verify | sed 's/^/   /'
+
+if ! docker info >/dev/null 2>&1; then
+  echo
+  echo "① ② Linux は測っていない（docker が動いていない）"
+  echo "   OrbStack か Docker を起こしてから、もう一度この試験を回すこと。"
+  echo "   **「測っていない」は「動く」ではない。**"
+  exit 0
+fi
+
+TMPD=$(mktemp -d)   # **shell の変数名は ASCII のみ。**日本語名は bash が受け取らない
+cat > "$TMPD/Dockerfile" <<'EOF'
+FROM python:3.12-slim
+# procps はわざと入れない（/proc だけで動くことを確かめるため）
+RUN apt-get update -qq && apt-get install -y -qq bubblewrap curl \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+EOF
+echo
+echo "Linux の作業場を用意している…"
+docker build -q -t "$IMG" "$TMPD" >/dev/null || { echo "作れなかった" >&2; exit 1; }
+rm -rf "$TMPD"
+
+# **--privileged が要るのは Docker の入れ子の都合。**素の Linux では要らない
+# （名前空間を作るのを Docker が既定で止めているため）。ここを黙って外すと
+# 「bwrap が動かない Linux」を測ることになり、全部 ★ になる。
+echo
+echo "① Linux + bwrap"
+docker run --rm --privileged -v "$GUARDRUN":/opt/guardrun.py:ro "$IMG" \
+  python3 /opt/guardrun.py --verify | sed 's/^/   /'
+
+echo
+echo "② Linux（囲う道具なし）"
+docker run --rm -v "$GUARDRUN":/opt/guardrun.py:ro "$IMG" \
+  sh -c 'mv /usr/bin/bwrap /usr/bin/bwrap.off; python3 /opt/guardrun.py --verify' \
+  | sed 's/^/   /'
+
+# ④ **普通のユーザ＋sudo＋別ユーザ**（GitHub の特権なし Ubuntu に寄せた腕）。（2026-09-24）
+# ①② は root で走るので sudo を通らない。2026-09-24 に GitHub ubuntu-22.04 で見つけた2つの穴
+# （sudo の pam_limits が rlimit を戻す／agent のファイルに人は setfacl できず同じ作業場の2回目が拒否）は
+# root では**原理的に見えない**。GitHub の枠が尽きた日に、手元で同じ形を作るために足した。
+# --privileged は ① と同じく bwrap の名前空間のため（AppArmor の userns 制限までは再現しない）。
+IMG4=guardrun-crosstest-user
+TMPD4=$(mktemp -d)
+cat > "$TMPD4/Dockerfile" <<'EOF4'
+FROM ubuntu:22.04
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      python3 bubblewrap sudo acl procps curl >/dev/null \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash runner \
+ && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+ && useradd -r -M -s /bin/sh _guardrun \
+ && chmod 755 /home/runner
+WORKDIR /home/runner
+EOF4
+docker build -q -t "$IMG4" "$TMPD4" >/dev/null || { echo "④ の作業場を作れなかった" >&2; exit 1; }
+rm -rf "$TMPD4"
+MARKS="$(dirname "$GUARDRUN")/guardrun-印の試験"
+echo
+echo "④ Linux 普通のユーザ＋sudo＋別ユーザ（GitHub の特権なし Ubuntu に寄せた形）"
+# **--init で pid 1 を root の init にし、試験は sudo -u runner で走らせる。**証明の「黙り」は「別の持ち主」の対照に pid 1 を使うので、
+# pid 1 が runner 自身の sh だと対照が成り立たず ★ になる（GitHub の本物の機械では pid 1 は root）。
+docker run --rm --init --privileged -v "$GUARDRUN":/opt/g/guardrun.py:ro -v "$MARKS":/opt/g/marks:ro "$IMG4" \
+  sh -c 'grep -h pam_limits /etc/pam.d/sudo /etc/pam.d/common-session-noninteractive 2>/dev/null | head -1 | sed "s/^/   pam: /";
+         ps -o user= -p 1 | sed "s/^/   pid 1 の持ち主: /";
+         sudo -u runner -H sh -c "cd /home/runner && python3 /opt/g/guardrun.py --verify; echo; PYTHONPATH=/opt/g timeout 600 python3 /opt/g/marks /opt/g/guardrun.py > /tmp/marks.txt 2>/dev/null; rc=\$?; grep -E \"^✗|通った\" /tmp/marks.txt; [ \$rc -eq 124 ] && echo \"⏱ 印の試験が600秒で返らなかった（固まった）\""' \
+  | sed 's/^/   /'
+
+# ⑤ **subreaper の下の置き去り**（systemd --user がある Linux の形）。（2026-09-24・M5）
+# 親を失ったものは pid 1 ではなく subreaper に引き取られる。居座りの網が ppid==1 だけを見ていた頃は、
+# 組を抜けた孫が作業場に居座ったまま見逃され、走りのあとに書いた。
+echo
+echo "⑤ subreaper（systemd を名乗る）の下で、壁の無い走りの置き去りを見つけられるか"
+docker run --rm --init -v "$GUARDRUN":/opt/g/guardrun.py:ro "$IMG4" bash -c '
+cat > /tmp/run.py <<"PY"
+import os, sys, tempfile, importlib.machinery, importlib.util
+spec = importlib.util.spec_from_loader("g", importlib.machinery.SourceFileLoader("g", "/opt/g/guardrun.py"))
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+w = tempfile.mkdtemp(prefix="m5-", dir="/tmp"); 印 = os.path.join(w, "孫が書いた.txt")
+孫 = "import os,time;os.setsid();time.sleep(4);open(%r,\"w\").write(\"x\")" % 印
+g.run(["/usr/bin/python3", "-c", "import subprocess;subprocess.Popen([\"/usr/bin/python3\",\"-c\",%r])" % 孫],
+      w, prove=False, enforcer=g.素通し())
+open("/tmp/印", "w").write(印)
+PY
+cat > /tmp/reaper.py <<"PY"
+import ctypes, subprocess, time, os
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)
+subprocess.run(["/usr/bin/python3", "/tmp/run.py"])
+time.sleep(6)
+print("   ○ 置き去りを始末した" if not os.path.exists(open("/tmp/印").read()) else "   ★ 置き去りが走りのあとに書いた")
+PY
+cd /tmp && exec -a systemd /usr/bin/python3 /tmp/reaper.py'
+
+# ⑥ **時計が飛んでも生きている走りを殺さない**（Linux の経過秒は起動からの時計）。（2026-09-24・C10）
+echo
+echo "⑥ 時計が10分進んでも、生きている親を別人と読まないか（番号の使い回しは見抜くか）"
+docker run --rm --init -v "$GUARDRUN":/opt/g/guardrun.py:ro "$IMG4" python3 -c '
+import time, tempfile, types, importlib.machinery, importlib.util
+spec = importlib.util.spec_from_loader("g", importlib.machinery.SourceFileLoader("g", "/opt/g/guardrun.py"))
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+d, 約束 = g.予告する("/tmp", ["x"], "試験", "ふつう", 60, 根=tempfile.mkdtemp())
+本物 = time.time
+g.time = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("_")})
+g.time.time = lambda: 本物() + 600
+生, 訳 = g._親の生死(約束)
+print("   %s 時計が10分進んだあと: %s" % ("○" if 生 else "★", 訳))
+if 約束.get("親の始まり_起動時計") is not None:
+    約束2 = dict(約束); 約束2["親の始まり_起動時計"] -= 1000
+    生2, 訳2 = g._親の生死(約束2)
+    print("   %s 番号の使い回し: %s" % ("○" if not 生2 else "★", 訳2))
+'
+
+# ⑦ **bwrap が置いてあるのに立たない機械**（Ubuntu 24.04 の特権なし・特権なしのコンテナ）。（2026-09-24・M9）
+# 前は置いてあるだけで選び、走りが全部拒否・証明 12★ だった。立たなければ見送ったと言い、別ユーザだけで走る。
+echo
+echo "⑦ bwrap が立たない機械（--privileged なし）"
+docker run --rm --init -v "$GUARDRUN":/opt/g/guardrun.py:ro "$IMG4" \
+  sh -c 'sudo -u runner -H sh -c "cd /home/runner && python3 /opt/g/guardrun.py --verify 2>&1 | grep -E \"執行:|見送った|  (○|★) \" | cut -c1-100; mkdir -p w && python3 /opt/g/guardrun.py --証明なし w sh -c \"echo x > a\" | grep -E \"判定\""' \
+  | sed 's/^/   /'
+
+echo
+echo "② で ★ が出るのは正しい（壁が無いのだから）。"
+echo "見るべきは **黙り が ○ のままか**——閉じ込めを諦めても、"
+echo "黙って終わった走りが見つかること。ここが ★ なら移植は失敗している。"

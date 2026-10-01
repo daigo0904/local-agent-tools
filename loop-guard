@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+loop-guard — 走っている最中の会話が「同じ手を繰り返しているだけ」になっていないか見る。
+
+    loop-guard            空回りを見つけたら知らせて止める（普段は無言）
+    loop-guard --report   いま走っている依頼を一覧で見せる（手を出さない）
+    loop-guard --dry-run  見つけた対象だけ出して、止めない
+    loop-guard --replay <session_id>   記録済みの会話に判定を当てる（試験用）
+
+## なぜ要るか
+
+2026-09-11 21:05、Discord から投げた1件の依頼が **翌 05:30 まで 8時間25分** 返らなかった。
+中身はこうだった。
+
+    道具を呼んだ回数  140 回（うち 139 回が progress_card）
+    実際に動かした命令  1 回だけ（21:09 の grep。以降ゼロ）
+    progress_card の中身  139 回すべて「1/3 done・value=20」で止まったまま
+    止まった理由  窓が埋まった（入力 65,520 / 65,536 で stopReason=length）
+
+**誰も止めなかったのではない。止める仕組みが無かった。**
+
+- `agents.defaults.timeoutSeconds` の既定は **172800秒（48時間）**。8時間半は予算内。
+- 本体の「固まり検知」は *進んでいない* 会話を探す。この会話は2分ごとに
+  道具を呼び続けていたので、**忙しく見えていた**。
+- context-guard は走っている会話を見ない。走っている間
+  `totalTokens` は `null` / `totalTokensFresh` は `false` で返るので、
+  一覧に入る前に落ちる（2026-09-12 に実測。走行中 None → 終了後 27,070）。
+  あの晩 context-guard は10分ごとに約50回巡回し、他の2件は縮めたが、
+  当の会話には**一度も触れていない**。
+
+つまり、この家の見張りは全員「止まったもの」を探していて、
+**止まらないもの**を探す者が居なかった。ここがその穴を埋める。
+
+## なぜ「時間」と「回数」の両方で決めるか
+
+どちらか片方では健全な仕事と見分けがつかない。手元の記録162件で測った。
+
+    1つの依頼で道具を呼んだ回数   中央値 1 ・ 上位95% 4 ・ 健全な最多 25
+    1つの依頼にかかった時間       中央値 1.5分 ・ 上位95% 4.2分 ・ 健全な最長 10.0分
+    事故                          140 回 / 492 分
+
+**健全な最多25回は4分で終わっており、健全な最長10分は道具を12回も呼んでいない。**
+だから「時間 かつ 回数」で切ると、事故だけが残る。
+実際にこの判定を全156件へ当てて、**誤爆0件・事故1件**を確かめてある（--replay）。
+
+片方だけにすると：
+  回数だけ → 4分で25回呼ぶ健全な仕事を殺す
+  時間だけ → 10分かかる健全な仕事を殺す
+
+## やらないこと
+
+- **道具の中身では判断しない。**「progress_card は無意味」と決め打つと、
+  次に別の道具で空回りしたときに見逃す。数えるのは形（回数と時間）だけにする。
+- **止められなかったのに止めたと言わない。**この家の一番嫌う壊れ方は
+  「壊れているのに壊れていると言わない」ほう。止め損ねたらそう書く。
+- 手入れ中は動かない（`claw hold`）。
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, stand_down  # noqa: E402
+
+G = Guard("loop-guard")
+
+AGENT_DB = os.path.expanduser(
+    "~/.openclaw/agents/main/agent/openclaw-agent.sqlite")
+
+# ── 判定基準。走らせる前に決めて、記録162件に当てて確かめた値 ──
+#
+# **健全な実績から逆算する。数字を思いつきで置かない。**
+HEALTHY_MAX_MINUTES = 10      # 実測：健全な依頼の最長（道具は12回未満だった）
+HEALTHY_MAX_CALLS = 25        # 実測：健全な依頼の最多（4分で終わっていた）
+
+# 健全な最長を少し超えたら疑う。ただし回数が伴うときだけ。
+SPIN_MINUTES = 8              # 健全な最長10分より短いが、回数の門で守られる
+SPIN_CALLS = 12               # 健全な最長10分の依頼はここに届かない
+
+# ── 返りを見ない判定（2026-09-13 追加）─────────────────────
+#
+# 本体の空回り検知は「引数が同一 **かつ 返りが同一**」の連続を数える。
+# だから**返りに時計や連番を混ぜる道具は、何回叩いても連続1のまま素通りする。**
+#   ・進捗カード … 表に revision 列があり `rev 1, 2, 3…` と毎回違った（139回で連続最長1）
+#   ・memory_search … 中身は同一・常に成功なのに、debug の managerMs/searchMs が毎回違う
+#     （2026-09-13 に実物を2回叩いて確認。debug を外すと完全に一致した）
+#
+# **こちらは返りを一切見ない。** 同じ道具・同じ引数が続いた回数だけで数える。
+# 記録165件の実測: 健全な依頼の最長は **4連続**。21連続が1件あるが、あれは
+# 同じ文面を22回送り続けた本物の失敗ループ（conversations_send）なので健全ではない。
+SAME_ARGS_STREAK = 8          # 健全の最長4の2倍。21回の失敗ループは捕まる
+
+# 窓の大きさ。ここに迫ったら、あと何手も残っていない。
+CONTEXT_WINDOW = 65536
+
+
+def _db():
+    """記録は読むだけ。書き込み中の相手を邪魔しない。"""
+    return sqlite3.connect(f"file:{AGENT_DB}?mode=ro", uri=True, timeout=10)
+
+
+def running_sessions():
+    """いま走っている会話。(名前, session_id) を返す。
+
+    **走っている会話は `totalTokens` が null で返る**ので、
+    使う数字は本体の一覧からではなく記録そのものから取る。"""
+    try:
+        p = subprocess.run(["openclaw", "sessions", "list", "--json",
+                            "--limit", "all"],
+                           capture_output=True, text=True, timeout=180,
+                           stdin=subprocess.DEVNULL)
+        d = json.loads(p.stdout)
+    except Exception as e:
+        G.log(f"会話の一覧が取れなかった: {e}")
+        return []
+    rows = d if isinstance(d, list) else (d.get("sessions") or d.get("items") or [])
+    out = []
+    for r in rows:
+        if r.get("status") != "running":
+            continue
+        sid = r.get("sessionId")
+        if sid:
+            out.append((str(r.get("key", "")), str(sid)))
+    return out
+
+
+def all_turns(session_id, db=None):
+    """依頼ごとに区切って数える。古い順に全部返す。
+
+    区切りは user / compaction / session のイベント。**会話まるごとではなく
+    1つの依頼で数える**のは、heartbeat が同じ命令を30分おきに何日も
+    呼び続けるため。あれは空回りではないので、間に区切りが入る形で弾く。
+
+    走っているものを見るときは最後の1つだけ要る（current_turn）。
+    記録に当てるときは全部要る（replay）。**数え方は1か所にしておく**——
+    試験用に別の数え方を書くと、試したものと動くものが別になる。"""
+    close = db is None
+    db = db or _db()
+    try:
+        rows = db.execute(
+            "select seq, created_at, event_json from transcript_events "
+            "where session_id=? order by seq", (session_id,)).fetchall()
+    except sqlite3.Error as e:
+        G.log(f"記録が読めなかった（{session_id[:8]}）: {e}")
+        return []
+    finally:
+        if close:
+            db.close()
+
+    out = []
+    turn = None
+    for seq, ts, ej in rows:
+        try:
+            e = json.loads(ej)
+        except ValueError:
+            continue
+        msg = e.get("message") or {}
+        role = msg.get("role") or e.get("type")
+        if role in ("user", "compaction", "session"):
+            if turn:
+                out.append(turn)
+            turn = {"seq": seq, "t0": ts, "t1": ts, "calls": 0,
+                    "tools": [], "sigs": [], "tokens": None, "ask": ""}
+            if role == "user":
+                c = msg.get("content")
+                turn["ask"] = (c if isinstance(c, str)
+                               else json.dumps(c, ensure_ascii=False))[:120]
+            continue
+        if turn is None or role != "assistant":
+            continue
+        turn["t1"] = ts
+        u = msg.get("usage") or {}
+        if isinstance(u.get("input"), int):
+            # **いちばん大きかった値を持つ。**最後の値だと、本体が途中で
+            # 縮めたあとの小さい数字が残り、どれだけ膨らんでいたかが消える
+            # （事故では 65,520 まで行ったのに、最後だけ見ると 32,243）。
+            turn["tokens"] = max(turn["tokens"] or 0, u["input"])
+        for c in (msg.get("content") or []):
+            if c.get("type") == "toolCall":
+                turn["calls"] += 1
+                turn["tools"].append(c.get("name") or "?")
+                # 引数まで含めた印。**返りは入れない**（返りを見ないのがこの判定の要点）
+                turn["sigs"].append((c.get("name") or "?",
+                                     _sig(c.get("arguments"))))
+                break
+    if turn:
+        out.append(turn)
+    return out
+
+
+def current_turn(session_id, db=None):
+    """いま処理している依頼ぶん。無ければ None。"""
+    turns = all_turns(session_id, db)
+    return turns[-1] if turns else None
+
+
+def spinning(turn, now_ms=None):
+    """空回りか。(はい/いいえ, 経過分) を返す。
+
+    **時間は「最後のイベントから」ではなく「依頼を受けてから」で数える。**
+    空回りは2分おきに跡を残すので、最後のイベントを見ると常に新しく見える。"""
+    if not turn:
+        return False, 0.0
+    now_ms = now_ms if now_ms is not None else time.time() * 1000
+    mins = (now_ms - turn["t0"]) / 60000.0
+    return (mins >= SPIN_MINUTES and turn["calls"] >= SPIN_CALLS), mins
+
+
+def _sig(args):
+    """引数の印。**見えない揺れを落としてから比べる。**
+
+    2026-09-13、同じ文面を22回送り続けた記録に当てたら連続1と出た。中を見ると
+    日付の中の空白1文字だけが普通の空白と NBSP(U+00A0) で違っていた。
+    **人の目には同じ、機械には別物。**完全一致だけで数えると、この程度の揺れで外れる。
+    空白の種類を揃え、連続する空白を1つに潰してから印にする。
+    """
+    text = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    text = "".join(" " if unicodedata.category(ch) in ("Zs", "Cf") else ch
+                   for ch in text)
+    return " ".join(text.split())
+
+
+def repeating(turn):
+    """同じ道具・同じ引数が、何回続いたか。**返りは見ない。**
+
+    (はい/いいえ, 連続回数, 道具の名前) を返す。
+
+    **末尾からではなく、その依頼の中で一番長かった連続を見る。**
+    末尾だけを見ると、最後の1手だけ引数がわずかに変わった時点で連続0に戻り、
+    直前まで22回繰り返していた事実が消える（実測でそうなった）。
+    見ているのは走っている依頼だけなので、「さっきまで繰り返していた」は
+    いま繰り返しているのとほぼ同じ意味になる。
+    """
+    sigs = (turn or {}).get("sigs") or []
+    最長, now, 道具, prev = 0, 0, "", None
+    for sig in sigs:
+        now = now + 1 if sig == prev else 1
+        prev = sig
+        if now > 最長:
+            最長, 道具 = now, sig[0]
+    return 最長 >= SAME_ARGS_STREAK, 最長, 道具
+
+
+def budget_minutes():
+    """本体が自分で落とすまでの分数。**設定を読む。ここに数字を書かない。**
+
+    知らせに「あと何分で自動的に落ちる」と書くため。
+    書き写すと、設定を変えた日から知らせが嘘になる。"""
+    try:
+        p = subprocess.run(["openclaw", "config", "get",
+                            "agents.defaults.timeoutSeconds"],
+                           capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        return int(p.stdout.strip().splitlines()[-1]) // 60
+    except Exception:
+        return None
+
+
+def stop(key):
+    """止めにいく。(止まったか, 言い分)。
+
+    **効かなかったら効かなかったと返す。**ここで嘘をつくと、
+    知らせを読んだ人が「もう止まっている」と思って何もしなくなる。
+
+    使えるのは `tasks cancel` だけ。2026-09-12 に3通り試した結果：
+
+      openclaw tasks cancel <会話名>      効いた（cli の実行で確認）
+      openclaw agent -m "/stop"           効かない。**走っている手の後ろに並ぶ**
+      gateway call sessions.abort         unauthorized（共有トークンでは足りない）
+
+    ただし **Discord から来た手は task として登録されていない**
+    （事故の run 40b13101 は task_runs に無かった）ので、
+    ここが空振りすることは十分ある。**そのときは本体の実行予算が最後の砦**。"""
+    try:
+        p = subprocess.run(["openclaw", "tasks", "cancel", key],
+                           capture_output=True, text=True, timeout=120,
+                           stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return False, str(e)[:200]
+    said = (p.stdout + p.stderr).strip()
+    return p.returncode == 0, said[-200:]
+
+
+def describe(turn, mins):
+    """何が起きているかを、数字で書く。"""
+    from collections import Counter
+    top = Counter(turn["tools"]).most_common(2)
+    lines = [f"  経過 {mins:.0f} 分 ・ 道具を {turn['calls']} 回"]
+    _, 連続, 道具 = repeating(turn)
+    if 連続 >= 2:
+        lines.append(f"  同じ手の繰り返し {道具} を {連続} 回続けて"
+                     f"（引数も同じ・返りは見ていない）")
+    if top:
+        lines.append("  内訳 " + " / ".join(f"{n} を {c} 回" for n, c in top))
+    if turn.get("tokens"):
+        tok = turn["tokens"]
+        left = CONTEXT_WINDOW - tok
+        lines.append(f"  いま送っている量 {tok:,} トークン"
+                     f"（窓 {CONTEXT_WINDOW:,} まであと {left:,}）")
+    if turn.get("ask"):
+        lines.append(f"  依頼 {turn['ask']}")
+    return "\n".join(x for x in lines if x)
+
+
+def main():
+    args = sys.argv[1:]
+    dry = "--dry-run" in args
+    report = "--report" in args
+
+    if "--selftest" in args:
+        return selftest()
+
+    if "--replay" in args:
+        return replay(args[args.index("--replay") + 1]
+                      if len(args) > args.index("--replay") + 1 else None)
+
+    held, why = stand_down(G, dry or report)
+    if held:
+        return 0
+
+    if not os.path.exists(AGENT_DB):
+        G.log(f"記録が見つからない: {AGENT_DB}")
+        return 1
+
+    rows = running_sessions()
+    if report:
+        print(f"空回りの判定: {SPIN_MINUTES} 分以上 かつ 道具 {SPIN_CALLS} 回以上")
+        print(f"　　　　　　　または 同じ道具・同じ引数が {SAME_ARGS_STREAK} 回以上続く"
+              f"（返りは見ない＝本体の検知がすり抜ける形）")
+        print(f"（健全な実績は 最長 {HEALTHY_MAX_MINUTES} 分 / 最多 "
+              f"{HEALTHY_MAX_CALLS} 回。両方は同時に起きない）\n")
+        if not rows:
+            print("  いま走っている依頼はありません")
+            return 0
+        db = _db()
+        try:
+            for key, sid in rows:
+                turn = current_turn(sid, db)
+                bad, mins = spinning(turn)
+                mark = "✗" if bad else "●"
+                calls = turn["calls"] if turn else 0
+                tok = (turn or {}).get("tokens")
+                print(f"  {mark} {key[:46]:<48} {mins:>5.0f}分 "
+                      f"道具{calls:>4}回 "
+                      + (f"{tok:,}トークン" if tok else ""))
+        finally:
+            db.close()
+        return 0
+
+    state = G.load_state()
+    db = _db()
+    hit = 0
+    try:
+        for key, sid in rows:
+            turn = current_turn(sid, db)
+            bad, mins = spinning(turn)
+            繰り返し, 連続, 連続道具 = repeating(turn)
+            bad = bad or 繰り返し
+            if not bad:
+                # 直ったら覚え書きを落とす。次に空回りしたらまた言えるように。
+                state.pop(f"told:{sid}", None)
+                continue
+            hit += 1
+            body = describe(turn, mins)
+            if dry:
+                print(f"空回り: {key}\n{body}")
+                continue
+
+            門 = (f"{SPIN_MINUTES}分・{SPIN_CALLS}回" if 連続 < SAME_ARGS_STREAK
+                  else f"同じ手 {連続} 回連続（{連続道具}）")
+            G.log(f"{key} が空回り（{mins:.0f}分・道具{turn['calls']}回・{門}）")
+            ok, said = stop(key)
+            G.log(("止めた: " if ok else "止められなかった: ") + said)
+
+            bud = budget_minutes()
+            left = (f"依頼から {bud} 分で自動的に落ちます"
+                    f"（あと {max(0, bud - int(mins))} 分）"
+                    if bud else "本体の実行予算で落ちるのを待つことになります")
+            tail = ("止めました。" if ok else
+                    f"**止められませんでした**（{said}）。\n"
+                    f"Discord でその会話に `/stop` と送ってください。\n"
+                    f"それも効かなければ、{left}。")
+            G.tell_once(
+                state, f"told:{sid}",
+                f"返事が返らない依頼が、同じ手を繰り返しているだけになっています。\n"
+                f"  {key}\n{body}\n"
+                f"（引っかかった門: {門}。健全な依頼はこの家で最長 "
+                f"{HEALTHY_MAX_MINUTES}分 / 最多 {HEALTHY_MAX_CALLS}回 / "
+                f"同じ手の連続は最長 4 回でした）\n"
+                f"{tail}")
+    finally:
+        db.close()
+    G.save_state(state)
+    return 0 if hit == 0 else 1
+
+
+def selftest():
+    """発火の条件を、その場で作った例に当てる。**判定は本番と同じ関数を使う。**
+
+    記録には memory_search を繰り返した例が無い（3回しか呼ばれていない）。
+    だが空回り検知をすり抜けるのはまさにこの形なので、例を作って確かめる。
+    **返りは一切渡していない**——この判定が返りを見ないことが、ここで担保される。
+    """
+    def turn(sigs):
+        return {"sigs": [(n, _sig(a)) for n, a in sigs], "calls": len(sigs)}
+
+    検査 = []
+
+    # ① memory_search を同じ問い合わせで8回（返りは毎回違うが、見ていない）
+    t = turn([("memory_search", {"query": "ollama"})] * SAME_ARGS_STREAK)
+    検査.append(("同じ問い合わせ8回で鳴る", repeating(t)[0] is True))
+
+    # ② 7回では鳴らない（境目のすぐ下）
+    t = turn([("memory_search", {"query": "ollama"})] * (SAME_ARGS_STREAK - 1))
+    検査.append(("7回では鳴らない", repeating(t)[0] is False))
+
+    # ③ 見えない空白1文字だけ違う繰り返しでも鳴る（2026-09-13 の実物と同じ形）
+    t = turn([("conversations_send", {"message": f"あ{ws}い"})
+              for ws in [" ", "\u00a0"] * 6])
+    検査.append(("見えない空白の揺れを越えて鳴る", repeating(t)[0] is True))
+
+    # ④ 引数が本当に違えば鳴らない（進んでいる依頼を止めない）
+    t = turn([("exec", {"command": f"echo {i}"}) for i in range(20)])
+    検査.append(("中身が違えば鳴らない", repeating(t)[0] is False))
+
+    # ⑤ 途中で連続が切れても、一番長い連続を見る
+    t = turn([("memory_search", {"query": "ollama"})] * SAME_ARGS_STREAK
+             + [("exec", {"command": "ls"})])
+    検査.append(("最後の1手で連続が切れても鳴る", repeating(t)[0] is True))
+
+    落ち = 0
+    for 名, 良 in 検査:
+        print(("  ok   " if 良 else "  NG   ") + 名)
+        落ち += 0 if 良 else 1
+    print(f"合計: {len(検査) - 落ち} 件成功 / {落ち} 件失敗")
+    return 0 if 落ち == 0 else 1
+
+
+def replay(session_id):
+    """記録済みの会話に判定を当てる。**当てるのは同じ関数**。
+
+    試験のために別の判定を書くと、試したものと動くものが別になる。"""
+    db = _db()
+    try:
+        if session_id:
+            ids = [r[0] for r in db.execute(
+                "select distinct session_id from transcript_events "
+                "where session_id like ?||'%'", (session_id,))]
+        else:
+            ids = [r[0] for r in db.execute(
+                "select distinct session_id from transcript_events")]
+        if not ids:
+            print("その会話は記録にありません")
+            return 1
+        fired = []
+        total = 0
+        for sid in ids:
+            for turn in all_turns(sid, db):
+                if turn["calls"] == 0:
+                    continue
+                total += 1
+                # 記録済みなので「いま」ではなく最後のイベント時刻で当てる
+                bad, mins = spinning(turn, now_ms=turn["t1"])
+                繰り返し, _, _ = repeating(turn)
+                if bad or 繰り返し:
+                    fired.append((sid, turn, mins))
+        print(f"当てた依頼 {total} 件（会話 {len(ids)} 件）"
+              f" / 引っかかった {len(fired)} 件")
+        for sid, turn, mins in fired:
+            print(f"  ✗ {sid[:8]}  {mins:.0f}分 ・ 道具 {turn['calls']} 回")
+            print(describe(turn, mins))
+        return 0
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

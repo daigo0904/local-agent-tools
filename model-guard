@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+model-guard — 頭脳（ollama）が「立っているのに答えない」状態を見つけて直す。
+
+数分おきに走らせる前提。普段は何もせず、何もしなかったことも報告しない。
+直したときと、直せなかったときだけ Discord に一言送る。
+
+    model-guard              点検して、必要なら直す（普段は無言）
+    model-guard --report     問題がなくても今の状態を表示する
+    model-guard --dry-run    調べるだけで直さない
+    model-guard --check      OK/NG だけ返す（claw や qwc から呼ぶ用）
+
+なぜプロセス監視では足りないか:
+  2026-08-30、ollama は動いていて /api/tags も即答するのに、
+  /api/chat が3回続けて永久に返らなくなった。ollama ps は
+  「17GB・100% GPU・Forever」と、どこも異常が無いように見えていた。
+  待っている側（qwc）は CPU 0% のまま黙って止まり、
+  こちらから見ると「考え込んでいる」のと区別がつかなかった。
+  立っているかではなく、**答えられるか**を確かめないと分からない。
+
+  line-guard が cloudflared について書いているのと同じ話で、
+  この家のシステムはどれも「落ちる」のではなく「黙る」形で壊れる。
+
+なぜ答えないだけですぐ再起動してはいけないか:
+  1. gemma4:26b は冷えていると読み込みだけで36秒かかる（実測）。
+     1回の遅さで殺すと、正常な立ち上がりを毎回潰すことになる。
+  2. ollama は同時1件でしか処理しない（llama-server が -np 1 で起動している）。
+     誰かが長い依頼を投げていれば、点検はその後ろで待たされる。
+     これを「固まった」と誤診して殺すと、動いていた仕事を壊す。
+
+  そこで、答えが返らなかったときは llama-server が仕事をしているかを見る。
+  実測では、生成中は CPU 7〜84%、待機中はちょうど 0.0% だった。
+  答えが返らない**かつ**誰も働いていない、が「固まった」の形である。
+
+なぜ点検で keep_alive を無期限にするのか:
+  このMacは「モデルを常駐させたままにする」運用にしてある。
+  実測で、冷えた状態は36秒、温まっていれば1.7秒で、差が20倍あるため。
+  点検はどのみち1トークン生成させるので、そのついでに温め直す役も持たせる。
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+# 見張りが共有する部品。同じものを4つに書き写していたが、
+# 書き写した当日に編集で1つ壊し、説明文もずれていた。
+# 独立を支えているのは別プロセス・別の時計・別の判断であって、
+# 同じ文字列を別々に持つことではない。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import (Guard, env_value, pulse_age, stand_down,  # noqa: E402
+                      kickstart, restart_service, settling, trim_file)
+from modellib import ctx_options  # noqa: E402  モデルの載せ方はここに集約（1つの Ollama を皆で使うため）
+
+G = Guard("model-guard")
+
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+CONFIG_FILE = os.path.expanduser("~/.openclaw/openclaw.json")
+
+# ── 何秒おきに走るか ──────────────────────────────────────
+#
+# **plist の StartInterval と必ず一致させること。**
+# ここまで、コードの中には「2分おき」(下の段取りの説明) と「60秒おき」(見送りの上限)
+# の2つの前提が同居していて、plist は60秒だった。おかげで
+#   「4分でモデルの積み直し、6分で ollama ごと入れ直し」と書いてある段取りが、
+#   実際には 2分 と 3分 で動いていた。
+# 冷えた gemma4:26b の読み込みが36秒かかることを考えると、2分は薄い。
+# 以下、回数ではなく**分**で決めて、ここで回数に直す。
+# 訓練（guard-drill の plist）が、この値と plist が食い違っていないかを毎日見る。
+INTERVAL_S = 60
+
+
+def rounds(minutes):
+    """「何分待つ」を「何回続けてダメだったら」に直す。"""
+    return max(1, round(minutes * 60 / INTERVAL_S))
+
+
+WATCHDOG_LABEL = "ai.openclaw.watchdog"
+# watchdog も60秒おき。10回ぶん見送ってもまだ余裕がある長さにする。
+WATCHDOG_STALE = 700
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_LABEL = "homebrew.mxcl.ollama"
+FALLBACK_MODEL = "gemma4:26b"
+
+# 冷えた状態の読み込みが36秒。その倍近くを待ってから「返らない」と判断する。
+#
+# 90秒にしていたが、1回の点検に1分49秒かかっていた。60秒おきに走らせている
+# のに1回が2分近いので、実質「1回試すのに2巡ぶん」使っていたことになる。
+# 復旧までの時間は、判断の回数ではなくここで決まっていた。
+# 環境変数で短くできるのは、復旧の段取りを試すため（本番では触らない）。
+PROBE_TIMEOUT = int(os.environ.get("MODEL_GUARD_TIMEOUT", "60"))
+# ── 「働いている」の見分け方 ────────────────────────────
+#
+# **CPU だけで見てはいけない。** 2026-08-31 に4つの状態を実測したら、
+# いちばん守りたい場面が、いちばん見えていなかった。
+#
+#   待機          CPU  0%     ログ 伸びない
+#   前処理中      CPU  0〜1%  ログ **常に伸びる**（2秒で約440バイト）
+#   生成中        CPU  6〜7%  ログ 断続的に伸びる
+#   固まり        CPU  約4%   ログ **伸びない**
+#
+# 前処理は GPU の仕事で、CPU はただ待っている。だから **16,524トークンを
+# 35秒かけて読んでいる最中でも CPU は 0〜1%** にしかならない。
+# 一方、固まった runner は約4%を回し続ける。**しきい値 3.0% の CPU 判定は、
+# 守るべき前処理を「暇」と読み、殺すべき固まりを「働いている」と読んでいた**
+# ——ちょうど裏返しだった。実際 2026-08-31 18時に ollama が無応答になったとき、
+# この見張りは10分間「処理中だから見送り」と書き続けて見逃した。
+#
+# 頼りになるのはログの伸び。前処理中は必ず伸び、固まっていれば1バイトも増えない。
+# CPU は、ログが静かになる区間のある生成中を拾うための補助に回す。
+BUSY_CPU = 5.5           # 固まりの約4%より上、生成中の6〜7%より下
+BUSY_SAMPLE = 1.5        # この秒数のあいだを見て判断する
+# 「処理中だから点検を見送る」を何回まで続けるか。60秒おきなので10回＝10分。
+BUSY_SKIP_MAX = 10
+
+# ── 積み直しの取り合いを見張る ────────────────────────────
+#
+# 見張りは「生きているか」しか見ていなかった。2026-08-31 の朝、qwc は飢えて
+# 死んでいたのに、ここは最後まで「正常」と書き続けていた。**誰も「不当に
+# 殺されている奴がいないか」を見ていなかった。**
+#
+# 幸い、この病気には はっきりした足跡が1本ある。ollama.log の
+# `starting llama-server`＝モデルの積み直しで、正常なら1日に数回しか出ない。
+# 当日は **25分で25回**だった。数えるだけで、初日の朝に気づけたはずのもの。
+OLLAMA_LOG = os.environ.get("OLLAMA_LOG", "/opt/homebrew/var/log/ollama.log")
+THRASH_WINDOW = 600      # 何秒のあいだを見るか（10分）
+THRASH_MAX = 3           # この回数を超えたら取り合っている
+THRASH_TELL_AGAIN = 3600 # 同じ話を繰り返さない間隔
+LOG_TAIL_BYTES = 512 * 1024  # ログは伸び続けるので末尾だけ読む
+
+# 何分ダメが続いたら、どこまで手を出すか。**分で決めて、回数には直させる。**
+#
+# 一度の失敗で殺してはいけない理由は2つあって、どちらも「時間」の話だった。
+#   1. 冷えた gemma4:26b は読み込みだけで36秒かかる（実測）
+#   2. ollama は同時1件なので、長い依頼の後ろで待たされることがある
+# なのに前は回数で書いてあり、plist の間隔が変わったときに一緒にずれた。
+KILL_RUNNER_AFTER = rounds(4)       # 4分…モデルを走らせている側だけ落とす
+RESTART_OLLAMA_AFTER = rounds(6)    # 6分…ollama ごと入れ直す
+GIVE_UP_AFTER = rounds(10)          # 10分…手に負えないので人に投げる
+# これだけ黙ったら、まだ直している途中でも知らせる。
+# 復旧は3〜5分で終わらせる前提なので、それを超えたら異常事態として扱う。
+TELL_AFTER = 5 * 60
+
+
+
+
+def default_model():
+    """ふだん使っているモデルを設定から拾う。設定を変えたら点検も勝手に追いかける。"""
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        name = cfg["agents"]["defaults"]["model"]["primary"]
+        # "ollama/gemma4:26b" のように前置きが付く
+        return name.split("/", 1)[1] if "/" in name else name
+    except (OSError, ValueError, KeyError, IndexError):
+        return FALLBACK_MODEL
+
+
+def runner_pids():
+    out = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True)
+    return [int(p) for p in out.stdout.split() if p.isdigit()]
+
+
+def log_size():
+    try:
+        return os.path.getsize(OLLAMA_LOG)
+    except OSError:
+        return None
+
+
+def log_worked(since):
+    """`since` バイト目から後ろに、**仕事をした跡**が書かれたか。
+
+    ただ伸びたかどうかで見てはいけない。ollama のログは HTTP の
+    アクセス記録（`[GIN]` 行）と runner の作業記録が同じファイルに混ざる。
+    見張り自身が `/api/tags` を叩いた1行を「働いている」と読んでしまい、
+    **固まった runner を見逃した**（2026-08-31 に実際に踏んだ）。
+    数えるのは `[GIN]` 以外の行だけにする。"""
+    if since is None:
+        return False
+    try:
+        with open(OLLAMA_LOG, "rb") as f:
+            f.seek(since)
+            fresh = f.read(64 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return False
+    for line in fresh.splitlines():
+        line = line.strip()
+        if line and not line.startswith("[GIN]"):
+            return True
+    return False
+
+
+def cpu_seconds(pid):
+    """そのプロセスがこれまでに使った CPU 時間（秒）。"""
+    out = subprocess.run(["ps", "-p", str(pid), "-o", "time="],
+                         capture_output=True, text=True)
+    try:
+        total = 0.0
+        for part in out.stdout.strip().split(":"):
+            total = total * 60 + float(part)
+        return total
+    except ValueError:
+        return None
+
+
+def runner_busy(sample=None):
+    """モデルを走らせている側が、いま仕事をしているか。
+
+    誰かの長い依頼を処理している最中と、固まっているのを分けるための判定。
+    迷ったら「働いている」に倒す（動いている仕事を殺すほうが損が大きい）。
+
+    見るものは2つ。**主はログの伸び**——前処理中は必ず伸び、固まっていれば
+    1バイトも増えない。CPU は補助で、ログが静かになる生成中を拾うためにある。
+    どちらの物差しも単独では裏返るので、必ず両方を見ること（理由は定数のところ）。"""
+    sample = BUSY_SAMPLE if sample is None else sample
+    pids = runner_pids()
+    if not pids:
+        return False
+
+    before_log = log_size()
+    before_cpu = {pid: cpu_seconds(pid) for pid in pids}
+    time.sleep(sample)
+
+    # ① 仕事の跡が書かれた＝何かを処理している（前処理はこれでしか見えない）
+    if log_worked(before_log):
+        return True
+
+    # ② CPU を使っている＝生成中。
+    #    **平均ではなく、この sample 秒で使ったぶんを見る。**
+    #    ps の %cpu は起動してからの平均なので、何時間も前の仕事が残ってしまう。
+    for pid in pids:
+        a, b = before_cpu.get(pid), cpu_seconds(pid)
+        if a is None or b is None:
+            continue
+        if 100 * (b - a) / sample >= BUSY_CPU:
+            return True
+    return False
+
+
+def alive():
+    """入り口が開いているか。開いていても答えるとは限らない（今回の件がそれ）。"""
+    try:
+        urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5).read()
+        return True
+    except Exception:
+        return False
+
+
+def probe(model):
+    """本当に1トークン返せるか。返せた秒数か、返せなければ None。
+
+    ついでに常駐させ直す（keep_alive: -1）。
+
+    **num_ctx を必ず一緒に渡すこと。**
+    渡さないと Ollama は既定の広さで積み直す。載っているものと広さが違うと、
+    Ollama にとっては別物なので、先に載っていたほうが降ろされる。
+    降ろされた側が誰かの依頼を処理中だったら、その依頼は途中で消えて、
+    頼んだ人には HTTP 500 "unexpected EOF" だけが返る。
+
+    2026-08-31 の朝がこれだった。qwc（65536）が 37,000 トークンの前処理に
+    2分かけているあいだ、この点検（広さ未指定＝32768）が60秒おきに積み直しをかけ、
+    qwc は1手も終われずに落ちていた。**点検が本番の作業を殺していた。**"""
+    # 広さは自分で決めず、modellib に決めてもらう（作法はあちらに書いてある）
+    options = ctx_options(model, {"num_predict": 1})
+    body = json.dumps({
+        "model": model,
+        "stream": False,
+        "keep_alive": -1,
+        "options": options,
+        "messages": [{"role": "user", "content": "ok"}],
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=body,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    try:
+        raw = urllib.request.urlopen(req, timeout=PROBE_TIMEOUT).read()
+        json.loads(raw)
+        return time.time() - t0
+    except Exception:
+        return None
+
+
+def resume_stopped():
+    """止められたまま残っているプロセスを動かし直す。
+
+    落ちてはいないが、止められていて応答しない状態がある。
+    このとき厄介なのは、**止まったプロセスもポートを握り続ける**こと。
+    launchctl で入れ直しても、新しい方が
+    `bind: address already in use` で上がれず、孤児が残ったままになる。
+
+    入れ直すより先に、まずこれを試す。いちばん軽くて、いちばん結果が読める。"""
+    woke = 0
+    for pat in ("ollama serve", "llama-server"):
+        out = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+        for pid in out.stdout.split():
+            st = subprocess.run(["ps", "-p", pid, "-o", "state="],
+                                capture_output=True, text=True).stdout.strip()
+            if "T" in st:
+                try:
+                    os.kill(int(pid), signal.SIGCONT)
+                    woke += 1
+                except (OSError, ProcessLookupError):
+                    pass
+    return woke
+
+
+def kill_runner():
+    """モデルを走らせている側だけ落とす。ollama 本体は生かしたまま積み直させる。"""
+    pids = runner_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+    return len(pids)
+
+
+def restart_ollama():
+    """ollama ごと入れ直す。**戻り値を捨てないこと。**
+
+    ここは長らく生の launchctl を呼んで結果を見ていなかった。
+    guardlib 側には「嘘をつく見張りは、居ないより悪い」と書いて直したはずの
+    穴が、こちらにそのまま残っていた（同じ形が check_watchdog にもあった）。
+    ollama は常駐なので、走っていても殺して入れ直す restart_service を使う。"""
+    how, why = restart_service(OLLAMA_LABEL)
+    return how, why
+
+
+
+
+def recent_loads(now=None):
+    """直近 THRASH_WINDOW 秒に積み直した回数と、そのときの広さ。
+
+    ログの行はこの形をしている:
+      time=2026-08-31T08:35:10.750+09:00 ... msg="starting llama-server" cmd="... -c 32768 ..."
+    """
+    try:
+        size = os.path.getsize(OLLAMA_LOG)
+        with open(OLLAMA_LOG, "rb") as f:
+            if size > LOG_TAIL_BYTES:
+                f.seek(size - LOG_TAIL_BYTES)
+                f.readline()  # 途中から読んだ最初の1行は捨てる
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+
+    now = now or datetime.now().astimezone()
+    found = []
+    for line in text.splitlines():
+        if "starting llama-server" not in line:
+            continue
+        m = re.search(r"time=(\S+)", line)
+        if not m:
+            continue
+        try:
+            when = datetime.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.astimezone()
+        if (now - when).total_seconds() > THRASH_WINDOW:
+            continue
+        width = re.search(r"-c (\d+)", line)
+        found.append((when, int(width.group(1)) if width else None))
+    return found
+
+
+def check_thrash(state, dry):
+    """モデルが繰り返し積み直されていないか＝誰かが誰かを降ろし続けていないか。
+
+    積み直された側の依頼は途中で消え、頼んだ側には HTTP 500 "unexpected EOF"
+    だけが返る。**降ろした側のログには何も残らない**ので、殺された側だけが
+    「自分かモデルが悪いのだろう」と見当違いの方向を疑うことになる。
+    ここで数えておけば、次からは名指しで見当が付く。
+
+    見分けは広さで付く。
+      広さが行き来している → 同じモデルを違う num_ctx で呼んでいる奴がいる
+      広さは同じなのに多い → 別のモデルと GPU の枠を取り合っている
+    """
+    loads = recent_loads()
+    if len(loads) <= THRASH_MAX:
+        state.pop("thrash_told", None)
+        return None
+
+    widths = sorted({w for _, w in loads if w})
+    if len(widths) > 1:
+        what = f"同じモデルを違う広さで呼んでいる道具があります（{' と '.join(str(w) for w in widths)}）"
+        hint = ("呼んでいる側の num_ctx を、いま載っている広さに合わせてください"
+                "（`ollama ps` の CONTEXT 列）。")
+    else:
+        what = "別のモデルと GPU の枠を取り合っています"
+        hint = "同時に使うモデルを減らすか、片方を小さいものにしてください。"
+    note = f"{len(loads)}回/{THRASH_WINDOW // 60}分・{what}"
+
+    if dry:
+        return note
+
+    told = state.get("thrash_told")
+    if told:
+        try:
+            if (datetime.now() - datetime.fromisoformat(told)).total_seconds() < THRASH_TELL_AGAIN:
+                return note  # さっき言ったばかり
+        except ValueError:
+            pass
+    state["thrash_told"] = datetime.now().isoformat(timespec="seconds")
+    G.log(f"積み直しが多い（{len(loads)}回/{THRASH_WINDOW // 60}分, 広さ {widths or '不明'}）")
+    G.notify(f"ローカルのモデルが {THRASH_WINDOW // 60} 分で {len(loads)} 回積み直されています。"
+             f"\n{what}。"
+             f"\n\nこの間、作業中の依頼は途中で消えて "
+             f'HTTP 500 "unexpected EOF" になっている可能性があります。'
+             f"\n{hint}")
+    return note
+
+
+def check_watchdog(state, dry):
+    """こちらを見張っている側が黙っていないか。黙っていれば蹴る。
+
+    片方向だと、見張りが1つ減ったことに誰も気づけない。
+    2つが互いを見て、はじめて「どちらか一方の死」までは拾えるようになる。
+
+    **ここが 2026-08-31 の蹴り合いの片側だった。**
+    生の `launchctl kickstart -k` を、戻り値を見ずに呼んでいた。`-k` は
+    走っている最中なら殺すので、起動直後の watchdog を毎回殺していた。
+    watchdog 側も同じことをこちらにしていたので、どちらも心拍を書けないまま
+    23分続いた。**50回「蹴った」と書いて、一度も直っていなかった。**
+
+    直したのは3つ。
+      1. guardlib の kickstart を使う（走っている相手は蹴らない・予算がある）
+      2. 何が起きたかをそのまま書く（"蹴った" と決め打ちしない）
+      3. 寝起きは判断しない（寝ている間は誰も心拍を打てないので、古くて当然）"""
+    age = pulse_age("watchdog")
+    if age is not None and age <= WATCHDOG_STALE:
+        state.pop("wd_told", None)
+        return None
+
+    # 寝ていた間の心拍の古さは、相手が死んだ証拠ではない。
+    # 渡すのは短い一定の猶予（既定5分）。しきい値そのものを渡さないこと。
+    if settling():
+        return "寝起きなので、まだ判断しない"
+
+    how = "一度も走っていない" if age is None else f"{int(age // 60)}分止まっている"
+    if dry:
+        return how
+
+    did, why = kickstart(WATCHDOG_LABEL)
+    G.log(f"watchdog が{how} → {why}")
+    if did == "kicked":
+        G.tell_once(state, "wd_told",
+                    f"見張り（watchdog）が{how}ので蹴り直しました。")
+    elif did == "failed":
+        G.tell_once(state, "wd_told",
+                    f"見張り（watchdog）が{how}のに、起こせませんでした（{why}）。"
+                    f"\nこれが黙っているあいだ、この見張り自身は誰も見ていません。"
+                    f"\n  {_見る言い方(WATCHDOG_LABEL)}")
+    return f"{how}（{why}）"
+
+
+
+
+def _見る言い方(label):
+    """その機械で、その仕事の記録を見るときの言い方。"""
+    import schedlib
+    s = schedlib.仕組み()
+    if s == "launchd":
+        return "launchctl print gui/$(id -u)/%s" % label
+    if s == "systemd":
+        return "systemctl --user status %s.service" % label
+    return "この機械には常駐・定時の仕組みが無い"
+
+
+def describe_span(since):
+    try:
+        t0 = datetime.fromisoformat(since)
+    except (ValueError, TypeError):
+        return None, None
+    mins = int((datetime.now() - t0).total_seconds()) // 60
+    span = f"{mins // 60}時間{mins % 60}分" if mins >= 60 else f"{mins}分"
+    return t0, span
+
+
+
+# ollama に手で足してある環境変数。**brew が消す。**
+# `brew services stop` は plist ごと消し、`start` はひな形から作り直す。
+# 2026-09-08、`claw up` がそれを踏んで `OLLAMA_CONTEXT_LENGTH=65536` が消えた。
+# 消えると、広さを指定していない道具が既定値に落ちて qwc を殺す
+# （2026-08-31 の積み直し合戦と同じ入口）。**黙って効いてくる。**
+OLLAMA_PLIST = os.path.expanduser("~/Library/LaunchAgents/homebrew.mxcl.ollama.plist")
+OLLAMA_WANT = {"OLLAMA_CONTEXT_LENGTH": "65536"}
+
+
+def ollama_env_missing():
+    """実物のプロセスに届いていない設定。**plist ではなくプロセスを見る。**
+
+    plist に書いてあることは、そのプロセスに渡っていることを意味しない。
+    `launchctl kickstart` は登録済みの定義を使うので、plist を書き換えても
+    読み直さない（2026-09-08 に踏んだ）。"""
+    try:
+        pid = subprocess.run(["pgrep", "-f", "ollama serve"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        if not pid:
+            return []
+        env = subprocess.run(["ps", "eww", pid[0]],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return []
+    return [k for k, v in OLLAMA_WANT.items() if f"{k}={v}" not in env]
+
+
+def restore_ollama_env(missing, dry):
+    """plist に書き戻して、定義を読み直させる。戻せたら True。"""
+    if dry:
+        return False
+    try:
+        import plistlib
+        with open(OLLAMA_PLIST, "rb") as f:
+            d = plistlib.load(f)
+        d.setdefault("EnvironmentVariables", {}).update(
+            {k: OLLAMA_WANT[k] for k in missing})
+        with open(OLLAMA_PLIST, "wb") as f:
+            plistlib.dump(d, f)
+    except Exception as e:
+        G.log(f"ollama の設定を戻せなかった: {e}")
+        return False
+    # 仕組み（launchd / systemd / 無し）は schedlib が知っている
+    import schedlib
+    schedlib.外す("homebrew.mxcl.ollama")
+    time.sleep(2)
+    schedlib.入れる("homebrew.mxcl.ollama", OLLAMA_PLIST)
+    for _ in range(30):
+        if not ollama_env_missing():
+            return True
+        time.sleep(1)
+    return False
+
+
+def check_ollama_env(state, dry):
+    """設定が実物に届いているか。戻したら一言返す。
+
+    **積み直しが起きるので、点検のたびに戻さない。**戻すのは消えたときだけで、
+    消えていなければ何もしない（ここが毎回走ると、それ自体が積み直しの原因になる）。"""
+    missing = ollama_env_missing()
+    if not missing:
+        state.pop("env_told", None)
+        return None
+    G.log(f"ollama に設定が届いていない: {', '.join(missing)}")
+    if restore_ollama_env(missing, dry):
+        G.notify(f"ollama の設定が消えていたので戻しました（{', '.join(missing)}）。\n"
+                 f"brew services を叩くと plist が作り直されて消えます。")
+        return f"戻した（{', '.join(missing)}）"
+    G.tell_once(state, "env_told",
+                f"ollama に {', '.join(missing)} が届いていません。戻せませんでした。\n"
+                f"広さを指定していない道具が既定値に落ちて、qwc を殺す入口になります。\n"
+                f"  launchctl bootout gui/$(id -u)/homebrew.mxcl.ollama\n"
+                f"  launchctl bootstrap gui/$(id -u) {OLLAMA_PLIST}")
+    return f"届いていない（{', '.join(missing)}）"
+
+
+def main():
+    args = set(sys.argv[1:])
+    dry = "--dry-run" in args
+
+    if not dry and "--report" not in args and "--check" not in args:
+        if not G.hold_lock():
+            return 0
+
+    # 「働いている」の見分けだけを外から確かめる口。
+    # ここが裏返ると、動いている仕事を殺すか、固まりを見逃すかの
+    # どちらかになる。訓練（guard-drill busy）がここを毎日叩く。
+    if "--busy" in args:
+        print("BUSY" if runner_busy() else "IDLE")
+        return 0
+
+    # 手入れ中なら点検そのものを見送る。**--busy より後ろに置くこと。**
+    # あちらは「働いているか」を外から確かめるだけの読み取りで、
+    # 訓練（guard-drill busy）が毎日叩いている。ここで塞ぐと訓練が黙る。
+    #
+    # 点検は 1 トークン生成させるので、手入れ中に走らせると
+    # 積み直しの取り合いを自分で起こす。
+    held, why = stand_down(G, dry)
+    if held:
+        if "--check" in args:
+            print(f"SKIP {why}")
+        elif "--report" in args:
+            print(f"見送り  {why}")
+        return 0
+
+    # ollama のログはこの見張りが読んでいる（積み直しの回数を数えるのに使う）。
+    # 読む側が、大きくなりすぎないようにも面倒を見る。
+    trim_file(OLLAMA_LOG)
+
+    model = default_model()
+    state = G.load_state()
+    fails = int(state.get("fails", 0))
+
+    # 見張り合いは先に済ませる。こちらの点検は最大90秒かかるので、
+    # 後ろに置くと ollama が重い日に相手の死を見つけるのが遅れる。
+    watchdog_note = check_watchdog(state, dry)
+
+    # **見送りより前に置くこと。** 取り合いが起きている最中は runner が忙しいので
+    # 点検は見送られる。後ろに置くと、いちばん見たいときに限って走らない。
+    thrash_note = check_thrash(state, dry)
+
+    # ollama に手で足した設定が、実物に届いているか。
+    # **積み直しの検知より後ろに置く。**戻すと積み直しが起きるので、
+    # 先に置くと自分で起こした積み直しを自分で数えることになる。
+    env_note = check_ollama_env(state, dry)
+
+    # **先に入り口を見る。**閉じているなら5秒で分かることを、
+    # 1トークン生成の時間切れ（最大60秒）まで待つ必要はない。
+    # ここを後ろに置いていたせいで、落ちているときの1回が1分49秒かかっていた。
+    # **働いている最中は、点検そのものを見送る。**
+    #
+    # 広さを揃えたので積み直しは起きなくなったが、それでも点検は列の後ろに並ぶ。
+    # 前処理に2分かかっている依頼の後ろで60秒の時間切れを待てば、点検は必ず失敗し、
+    # 失敗が続けば「応答なし」と判断して復旧に入る。動いている仕事を殺す側に倒れる。
+    #
+    # 見送りっぱなしにはしない。CPU を使ったまま固まっているものを
+    # 「働いている」と読み違えたときに、永久に気づけなくなるため。
+    skips = int(state.get("skips", 0))
+    if alive() and runner_busy() and skips < BUSY_SKIP_MAX:
+        state["skips"] = skips + 1
+        G.save_state(state)
+        G.beat()
+        G.log(f"点検を見送り（誰かの依頼を処理中、{skips + 1}回目）")
+        if "--check" in args:
+            print(f"SKIP {model} 処理中")
+        elif "--report" in args:
+            print(f"見送り  {model} は誰かの依頼を処理中  （点検は次回。{skips + 1}回目）")
+            print(f"watchdog: {watchdog_note or '走っている'}")
+            print(f"積み直し: {thrash_note or '落ち着いている'}")
+            print(f"ollama設定: {env_note or '実物に届いている'}")
+        return 0
+    state.pop("skips", None)
+
+    # 点検のあいだにログが伸びたかを控えておく。
+    # 伸びていれば、答えが返らなかったのは**列の後ろに並んだから**であって、
+    # 死んでいるからではない。ここを見ないと、長い依頼を処理中の runner を
+    # 「応答なし」と読んで殺すことになる（2026-08-31 08:40 がそれ）。
+    log_before = log_size()
+    took = probe(model) if alive() else None
+    served_someone = took is None and log_worked(log_before)
+
+    if served_someone:
+        # 誰かの仕事は進んでいた。失敗には数えず、次の巡回に回す。
+        state["skips"] = skips + 1
+        G.save_state(state)
+        G.beat()
+        G.log(f"点検は返らなかったが、その間もログは進んでいた（処理中、{skips + 1}回目）")
+        if "--check" in args:
+            print(f"SKIP {model} 処理中")
+        elif "--report" in args:
+            print(f"見送り  {model} は誰かの依頼を処理中（点検は返らないが、仕事は進んでいる）")
+            print(f"watchdog: {watchdog_note or '走っている'}")
+            print(f"積み直し: {thrash_note or '落ち着いている'}")
+            print(f"ollama設定: {env_note or '実物に届いている'}")
+        return 0
+
+    if took is not None:
+        # 直った、あるいはずっと元気だった。
+        if fails:
+            t0, span = describe_span(state.get("down_since"))
+            G.log(f"復旧 ({model}, {took:.1f}s, 連続失敗 {fails} 回)")
+            if t0 and (datetime.now() - t0).total_seconds() >= 180:
+                G.notify(f"ローカルのモデルが {t0.strftime('%H:%M')} から {span} 応答しませんでした。"
+                       f"いま復旧しています（{model}・{took:.1f}秒で応答）。"
+                       f"\nこの間に投げた依頼は返っていないはずです。")
+        state.pop("told", None)
+        # 諦めた印も消す。次に落ちたときは、また最初から段を上がってよい。
+        state.pop("gave_up", None)
+        state.update({"last_ok": datetime.now().isoformat(timespec="seconds"),
+                      "last_ok_seconds": round(took, 1), "model": model, "fails": 0})
+        state.pop("down_since", None)
+        state.pop("cause", None)
+        G.save_state(state)
+        G.beat()
+        if "--check" in args:
+            print(f"OK {model} {took:.1f}s")
+        elif "--report" in args:
+            print(f"正常  {model} が {took:.1f} 秒で応答  （常駐: {'あり' if alive() else 'なし'}）")
+            print(f"watchdog: {watchdog_note or '走っている'}")
+            print(f"積み直し: {thrash_note or '落ち着いている'}")
+            print(f"ollama設定: {env_note or '実物に届いている'}")
+        return 0
+
+    # ここから下は「1トークンも返ってこなかった」場合。
+    fails += 1
+    busy = runner_busy()
+    reachable = alive()
+    cause = ("入り口が閉じている" if not reachable
+             else "誰かの依頼を処理中" if busy else "立っているが答えない")
+
+    state["fails"] = fails
+    state.setdefault("down_since", datetime.now().isoformat(timespec="seconds"))
+    state["cause"] = cause
+    G.save_state(state)
+    # 心拍は、ollama が答えなくても残す。
+    # last_ok は「ollama が答えた」記録なので、落ちている間は古いまま止まる。
+    # それを「見張りが死んだ」と取り違えると、直す相手を間違える。
+    G.beat()
+    G.log(f"応答なし ({model}, {fails}回目, {cause})")
+
+    if "--check" in args:
+        print(f"NG {model} {cause}")
+    elif "--report" in args:
+        print(f"応答なし  {model}  {cause}  （連続 {fails} 回）")
+        print(f"積み直し: {thrash_note or '落ち着いている'}")
+
+    # 働いている最中なら、待つ。動いている仕事を壊すほうが損が大きい。
+    if busy:
+        return 1
+    if dry:
+        print(f"[dry-run] {fails} 回目・{cause} → ここで手を出すところ")
+        return 1
+
+    # 何回目かではなく、**何分黙っているか**で知らせる。
+    # 「30分止まっていました」と後から知るのが一番困るので、
+    # 段取りの途中でも、決めた時間を超えたらその場で伝える。
+    t0, span = describe_span(state.get("down_since"))
+    if t0 and (datetime.now() - t0).total_seconds() >= TELL_AFTER:
+        # tell_once は覚え書きを保存してから送る。順番が逆だと、送った直後に
+        # 殺されたときに「まだ言っていない」ことになって、同じ話を繰り返す。
+        if G.tell_once(state, "told",
+                       f"ローカルのモデルが {span} 応答していません（{cause}）。"
+                       f"\nまだ直そうとしていますが、時間がかかっています。"):
+            G.log(f"{span} 黙っているので途中で知らせた")
+
+    # 段取りの一番手前。止められているだけなら、これで戻る。
+    # 入れ直しより先に試すのは、孤児がポートを握って新しい方が上がれなくなるため。
+    woke = resume_stopped()
+    if woke:
+        G.log(f"止められていたプロセスを動かし直した ({woke} 件)")
+        return 1
+
+    # **段は上から見ること。** ここは前まで `fails == GIVE_UP_AFTER` と
+    # ちょうど一致でしか見ていなかった。そのせいで諦めた次の回からは
+    # `elif fails >= RESTART_OLLAMA_AFTER` に落ち、**1分おきに永久に
+    # ollama を入れ直し続けていた。しかも二度と知らせなかった。**
+    # 「手で見てください」と言った直後から、黙って壊し続ける形だった。
+    if fails >= GIVE_UP_AFTER:
+        # ここから先は何もしない。効かない手を繰り返すのは、直しているのではない。
+        G.tell_once(state, "gave_up",
+                    f"ローカルのモデル（{model}）が {GIVE_UP_AFTER} 回続けて応答しません。"
+                    f"入れ直しても戻らないので、手で見てください。"
+                    f"\nこれ以上は自動で手を出しません（入れ直しを繰り返しても直らないため）。"
+                    f"\n  ollama ps / tail ~/.openclaw/logs/model-guard.log")
+        G.log(f"直せないので手出しをやめた（{fails}回目）")
+    elif fails >= RESTART_OLLAMA_AFTER:
+        how, why = restart_ollama()
+        G.log(f"ollama ごと入れ直した（{how}: {why}）")
+    elif fails >= KILL_RUNNER_AFTER:
+        n = kill_runner()
+        G.log(f"モデルを走らせている側を落とした ({n} 件)")
+
+    return 1
+
+
+if __name__ == "__main__":
+    # 落ちても心拍だけは残す。生きているのに心拍が無いと、相手はそれを
+    # 「死んだ」と読んで蹴りにくる。2026-08-31 の蹴り合いはそこから始まった。
+    sys.exit(G.run(main))

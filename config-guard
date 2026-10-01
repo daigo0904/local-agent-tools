@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+config-guard — OpenClaw の設定を、いつでも戻せる状態にしておく。
+
+    config-guard              いまの状態（普段はこれ）
+    config-guard --save       いまの設定を「動いた形」として記録する
+    config-guard --diff       動いた形から何が変わったか
+    config-guard --rollback   動いた形に戻す
+    config-guard --log        これまでの記録
+
+    --rollback に付けられるもの:
+      --stop-gateway   先にゲートウェイを登録から外してから戻す
+      --quiet          表示しない（見張りから呼ぶとき）
+
+## なぜ要るか
+
+`openclaw.json` の控え（.bak）が9個たまっていた。手で写しを取るしかなく、
+壊しても何を変えたのか分からない状態だった。**設定を変えられるなら、
+戻せなければならない。**
+
+## 戻したと言う前に、実物を読む（2026-09-06 追加）
+
+`git checkout` の終了コードは「git が仕事をした」までしか保証しない。
+**そのあと誰かが書き直せば、中身は戻っていないのに 0 が返る。**
+
+2026-09-06、更新に失敗したゲートウェイが10秒おきに起動と死亡を繰り返す中で
+`--rollback` を呼んだ。表示は「動いた形に戻しました」。実際には**1バイトも
+変わっていなかった**。起動途中のゲートウェイが、死ぬ前に設定を自分の形へ
+書き直していたため。戻す道具が、戻せていないのに成功と報告していた。
+
+だから今は、書いたあとに**実物を2回読む**。1回目は git が本当に書いたか。
+2回目は数秒後で、書いたものが上書きされていないか。上書きは数秒で起きるので、
+待たずに1回だけ見ると見逃す。
+
+## 訓練では、この壊れ方を再現できない
+
+guard-drill は設定に壊れた行を足して落とす。**壊れた JSON はゲートウェイが
+読めないので、書き直すこともできない。**だから訓練では戻しが必ず効く。
+本番で危ないのは、文法としては正しく読めてしまう設定のほうで、そのときだけ
+書き直しが起きる。**訓練が通ったことは、ここが動く証拠にならない。**
+
+## 「動いた形」の意味
+
+ただ保存した設定ではない。**その設定で受け口が実際に応答したこと**を
+確かめてから印を付ける。動かない設定に戻しても意味がないので、
+確かめずに印を動かすことはしない。
+
+## 戻すときに、いまのものを捨てない
+
+戻す前に、壊れている今の設定も必ず記録してから戻す。
+「戻したら、何が悪かったのか分からなくなった」を避けるため。
+
+## ここは手元だけ
+
+どこにも push しない。鍵（.env）は追っていないが、自分を指すID
+（LINE / Discord）は実物のまま入っている。公開している設定のひな形は
+別にある（local-ai-stack の openclaw/）。
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, OPENCLAW  # noqa: E402
+
+G = Guard("config-guard")
+GOOD = "last-good"          # 動いた形を指す印
+BIN = os.path.expanduser("~/bin")
+CONFIG = os.path.join(OPENCLAW, "openclaw.json")
+GATEWAY = "ai.openclaw.gateway"
+
+# 書いた設定が上書きされるまでの猶予。実測では、起動に失敗するゲートウェイが
+# 設定を書き直すまで2秒だった。取りこぼさないよう、その倍を見る。
+SETTLE = 4
+
+OK, NG, WARN = "\033[32m●\033[0m", "\033[31m●\033[0m", "\033[33m●\033[0m"
+
+
+def git(*args, check=False):
+    r = subprocess.run(["git", *args], cwd=OPENCLAW, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r
+
+
+def has_repo():
+    return git("rev-parse", "--git-dir").returncode == 0
+
+
+def good_ref():
+    r = git("rev-parse", "--verify", f"refs/tags/{GOOD}")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def dirty():
+    """記録していない変更があるか。"""
+    return bool(git("status", "--porcelain").stdout.strip())
+
+
+def gateway_loaded():
+    """ゲートウェイが launchd に登録されているか。
+
+    **「動いているか」ではなく「登録されているか」を見る。**
+    KeepAlive が付いているので、登録されていれば、いま PID が無くても
+    数秒後には必ず起きてくる。起きたゲートウェイは設定を読み、自分の形に
+    書き直してから（起動に失敗するなら）死ぬ。
+    つまり登録されている限り、こちらが書いた設定は数秒で消える。"""
+    import schedlib
+    return GATEWAY in schedlib.PID一覧(接頭=None)
+
+
+def unload_gateway():
+    """ゲートウェイを登録から外す。
+
+    `launchctl stop` では止まらない。KeepAlive が即座に起こし直すので、
+    外す（bootout）しかない。戻したあとに起こすのは呼んだ側の仕事。"""
+    import schedlib
+    schedlib.外す(GATEWAY)
+    for _ in range(20):
+        if not gateway_loaded():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def good_blob():
+    """「動いた形」の openclaw.json の中身。戻した結果を突き合わせる相手。"""
+    r = git("show", f"{GOOD}:openclaw.json")
+    return r.stdout if r.returncode == 0 else None
+
+
+def landed(want):
+    """書いた中身が実物に残っているか。(残ったか, 理由) を返す。
+
+    2回読む。1回目は git が本当に書いたかの確認、2回目は数秒後で、
+    書いたものが誰かに上書きされていないかの確認。
+    **1回しか読まないと、上書きされる側の壊れ方を必ず見逃す。**"""
+    for phase, wait in (("書き戻した中身になっていない", 0),
+                        (f"{SETTLE}秒後に別のものへ書き直された", SETTLE)):
+        if wait:
+            time.sleep(wait)
+        try:
+            with open(CONFIG) as f:
+                got = f.read()
+        except OSError as e:
+            return False, f"設定を読めない（{type(e).__name__}）"
+        if got != want:
+            return False, phase
+    return True, ""
+
+
+def healthy():
+    """この設定で、受け口が本当に応答するか。
+
+    ポートの開閉では見ない。**止まったプロセスもポートは握ったまま**なので、
+    設定が壊れていても「開いている」と出てしまう。
+
+    **watchdog には聞かない。**あちらは元気なときにこちらの --save を呼ぶので、
+    ここで watchdog に聞くと互いを呼び合って止まらなくなる（実際にそうなった）。
+    見張りどうしは、判断を借りずにそれぞれが直接確かめる。"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 18789), timeout=2):
+            pass
+    except OSError:
+        return False
+    env = dict(os.environ)
+    env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "/usr/bin:/bin")
+    try:
+        r = subprocess.run(["/opt/homebrew/bin/openclaw", "health"],
+                           capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and "Gateway event loop" in r.stdout
+
+
+def commit(message):
+    if not dirty():
+        return None
+    git("add", "-A")
+    git("-c", "user.name=config-guard", "-c", "user.email=config-guard@local",
+        "commit", "-q", "-m", message)
+    return git("rev-parse", "--short", "HEAD").stdout.strip()
+
+
+# ── 守りの設定 ────────────────────────────────────────────
+#
+# **「動いた形」は、gateway が ok だった瞬間の実物をそのまま焼き付ける。**
+# だから守りの設定が1つ黙って消えても、消えた形が正解として保存される。
+#
+# 2026-09-12 23:10 に実際にそうなった。config の訓練のあとで保存した
+# `fd6a35d` には `tools.updatePlan` が入っておらず、翌 00:00 に同じ形を
+# 再確認し、**05:30 の訓練が「進捗カードが戻っている」で落ちるまで7時間**
+# 誰も気づかなかった。gateway は ok を返し続けていた。
+#
+# ここに挙げるのは「消えたことが事故になった」ものだけ。
+# **予防で増やさない**——増やすほど、正当な削除でも保存が止まる。
+守りの設定 = [
+    ("tools.updatePlan", False,
+     "進捗カード。2026-09-11 の8時間25分の空回りはこれが燃料だった"
+     "（返りが毎回変わるので、どの空回り検知にも原理的に引っかからない）"),
+    ("tools.loopDetection.enabled", True,
+     "本体の空回り検知"),
+    ("agents.defaults.timeoutSeconds", (1, 3600),
+     "1回の実行予算。無いと既定の48時間になり、あの事故はそこまで伸びた"),
+    ("tools.deny", {"conversations_send"},
+     "長い識別子を写させる道具。2026-09-09 に37文字を5文字落として26回中23回失敗した。"
+     "**写し損ねは確率的なので、指示や再試行では潰れない**——写す作業ごと外すしかない"),
+]
+
+
+未設定 = object()          # 「無い」と「None が入っている」を分けるための目印
+
+
+def _ほる(cfg, path):
+    """"a.b.c" をたどる。無ければ KeyError ではなく目印を返す。"""
+    cur = cfg
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return 未設定
+        cur = cur[key]
+    return cur
+
+
+def 守りを確かめる(cfg=None):
+    """(そろっているか, [欠けているものの説明]) を返す。
+
+    **判定だけを切り出してあるのは、訓練が本物を触らずに試せるようにするため。**
+    引数に設定を渡せば、その中身で判定する。"""
+    if cfg is None:
+        try:
+            with open(CONFIG) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as e:
+            return False, [f"設定が読めない（{type(e).__name__}）"]
+    欠け = []
+    for path, 期待, why in 守りの設定:
+        v = _ほる(cfg, path)
+        if v is 未設定:
+            欠け.append(f"{path} が消えている（{why}）")
+        elif isinstance(期待, set):
+            # **含まれているか**を見る（一覧から1つ消えるのが事故の形）。
+            中身 = set(v) if isinstance(v, (list, tuple)) else set()
+            抜け = 期待 - 中身
+            if 抜け:
+                欠け.append("%s から %s が外れている（%s）"
+                            % (path, "・".join(sorted(抜け)), why))
+        elif isinstance(期待, tuple):
+            lo, hi = 期待
+            if not (isinstance(v, int) and lo <= v <= hi):
+                欠け.append(f"{path} が {v}（{lo}〜{hi} のはず・{why}）")
+        elif v != 期待:
+            欠け.append(f"{path} が {v}（{期待} のはず・{why}）")
+    return not 欠け, 欠け
+
+
+def 消えた項目(limit=12):
+    """前の「動いた形」にあって、いまの設定から消えている道筋。
+
+    **これは知らせるだけで、保存は止めない。**`doctor --fix` が廃止項目を
+    外すのは正当な削除で、2026-09-06 に実際にそうなった。
+    止めると、正しい更新のたびに人が --force を打つことになる。"""
+    ref = good_ref()
+    if not ref:
+        return []
+    try:
+        old = json.loads(git("show", f"{ref}:openclaw.json").stdout)
+        with open(CONFIG) as f:
+            new = json.load(f)
+    except (OSError, ValueError):
+        return []
+
+    def flat(d, prefix=""):
+        out = set()
+        if isinstance(d, dict):
+            for k, v in d.items():
+                p = f"{prefix}.{k}" if prefix else k
+                out.add(p)
+                out |= flat(v, p)
+        return out
+    消えた = sorted(flat(old) - flat(new))
+    # 親が消えれば子も全部消える。親だけ言えば足りる。
+    return [p for p in 消えた
+            if not any(p.startswith(q + ".") for q in 消えた)][:limit]
+
+
+def cmd_save(force=False):
+    """いまの設定を「動いた形」にする。
+
+    **動いていることと、守りが残っていることの両方を確かめてから。**
+    受け口が応答するだけでは足りない——守りの設定が消えた形でも、
+    gateway は元気に ok を返す（2026-09-12 に7時間そうだった）。"""
+    そろった, 欠け = 守りを確かめる()
+    if not そろった and not force:
+        print(f"  {NG} 守りの設定が欠けているので、印は動かしません。")
+        for x in 欠け:
+            print(f"     ・{x}")
+        print("     いまの形を「動いた形」にすると、**欠けた形が正解になります**。")
+        print("     先に設定を直すか、意図した変更なら --force を付けてください。")
+        G.log("動いた形の更新を断った: " + " / ".join(欠け))
+        G.notify("設定の「動いた形」を更新しようとしましたが、守りの設定が欠けています。\n"
+                 + "\n".join(f"・{x}" for x in 欠け)
+                 + "\nこのまま記録すると、欠けた形が「戻る先」になります。")
+        return 1
+    if not force and not healthy():
+        print(f"  {NG} 受け口が応答しないので、印は動かしません。")
+        print("     いまの設定は動いていません。--force で無理に印を付けられますが、")
+        print("     動かない形に戻れるようになるだけです。")
+        return 1
+    消えた = 消えた項目()
+    c = commit(f"動いた形 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    git("tag", "-f", GOOD)
+    print(f"  {OK} いまの設定を「動いた形」として記録しました" + (f"（{c}）" if c else "（変更なし）"))
+    if not そろった:
+        print(f"  {WARN} 守りの設定が欠けたまま記録しました（--force）")
+    if 消えた:
+        # **止めないが、黙らない。**正当な削除もここを通るので、
+        # 人が「それは消えてよいものか」を1回だけ見られるようにする。
+        print(f"  {WARN} 前の「動いた形」から {len(消えた)} 項目が消えています")
+        for p in 消えた:
+            print(f"     ・{p}")
+        G.log("動いた形から消えた項目: " + " / ".join(消えた))
+    G.log(f"動いた形を更新: {git('rev-parse', '--short', GOOD).stdout.strip()}")
+    return 0
+
+
+def cmd_diff():
+    ref = good_ref()
+    if not ref:
+        print("  まだ「動いた形」がありません。config-guard --save で作れます。")
+        return 1
+    r = git("diff", GOOD, "--stat")
+    body = git("diff", GOOD)
+    if not r.stdout.strip() and not dirty():
+        print("  動いた形と同じです。")
+        return 0
+    print(git("diff", GOOD, "--", ".").stdout or body.stdout or "  （記録されていない変更のみ）")
+    print(git("diff", "--stat").stdout)
+    return 0
+
+
+def cmd_rollback(quiet=False, stop_gateway=False):
+    """動いた形に戻す。戻す前に、いまのものも必ず残す。
+
+    **戻したと言う前に、実物を読んで確かめる。**
+    経緯は冒頭の「戻したと言う前に、実物を読む」を見ること。"""
+    ref = good_ref()
+    if not ref:
+        G.log("戻せない：動いた形がまだ無い")
+        if not quiet:
+            print(f"  {NG} 「動いた形」がまだありません。戻す先がありません。")
+        return 1
+
+    want = good_blob()
+    if want is None:
+        G.log("戻せない：動いた形に openclaw.json が入っていない")
+        if not quiet:
+            print(f"  {NG} 「動いた形」に openclaw.json がありません。")
+        return 1
+
+    # 登録されたままだと、書いた設定は起動のたびに書き直されて消える。
+    # ここで黙って書いて「戻した」と言うのが、いちばんやってはいけないこと。
+    if gateway_loaded():
+        if not stop_gateway:
+            G.log("戻さなかった：ゲートウェイが登録されたままで、書いても上書きされる")
+            if not quiet:
+                print(f"  {NG} ゲートウェイが登録されたままです。戻しませんでした。")
+                print("     このまま書いても、起動のたびに設定を書き直されて消えます。")
+                print("     先に外してから戻す:  config-guard --rollback --stop-gateway")
+            return 1
+        if not unload_gateway():
+            G.log("戻せない：ゲートウェイを登録から外せなかった")
+            if not quiet:
+                print(f"  {NG} ゲートウェイを外せませんでした。戻していません。")
+            return 1
+        if not quiet:
+            print("  … ゲートウェイを登録から外しました（戻したあと自分で起こすこと）")
+
+    kept = commit(f"戻す前の形 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    r = git("checkout", GOOD, "--", ".")
+    if r.returncode != 0:
+        G.log(f"戻せなかった: {r.stderr.strip()}")
+        if not quiet:
+            print(f"  {NG} 戻せませんでした: {r.stderr.strip()}")
+        return 1
+
+    ok, why = landed(want)
+    if not ok:
+        G.log(f"戻したつもりが戻っていない: {why}")
+        if not quiet:
+            print(f"  {NG} 戻せていません: {why}")
+            print("     git は書いたと言っていますが、実物はそうなっていません。")
+            print("     設定を書き換えている別のものを止めてから、もう一度。")
+        return 1
+
+    G.log(f"動いた形に戻した・実物で確認済み（戻す前: {kept or '変更なし'}）")
+    if not quiet:
+        print(f"  {OK} 動いた形に戻しました" + (f"（戻す前の形は {kept} に残してあります）" if kept else ""))
+    return 0
+
+
+def cmd_status():
+    if not has_repo():
+        print(f"  {NG} まだ版管理していません。")
+        return 1
+    ref = good_ref()
+    print("OpenClaw の設定")
+    if ref:
+        when = git("log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M", GOOD).stdout.strip()
+        print(f"  {OK} 動いた形  {git('rev-parse','--short',GOOD).stdout.strip()}  {when}")
+    else:
+        print(f"  {WARN} 動いた形  まだ無い（config-guard --save で作る）")
+
+    if dirty():
+        n = len(git("status", "--porcelain").stdout.strip().splitlines())
+        print(f"  {WARN} いまの設定  記録していない変更が {n} 件")
+        for line in git("status", "--porcelain").stdout.strip().splitlines():
+            print(f"        {line}")
+    else:
+        print(f"  {OK} いまの設定  記録済みのものと同じ")
+
+    n = git("rev-list", "--count", "HEAD").stdout.strip()
+    print(f"\n  記録は {n} 件。 変更を見る: config-guard --diff / 戻す: config-guard --rollback")
+    return 0
+
+
+def cmd_log():
+    print(git("log", "--format=  %h  %cd  %s", "--date=format:%Y-%m-%d %H:%M", "-20").stdout, end="")
+    ref = good_ref()
+    if ref:
+        print(f"\n  「動いた形」は {git('rev-parse','--short',GOOD).stdout.strip()}")
+    return 0
+
+
+def main():
+    """分岐は1か所にまとめてある。**Guard.run に通すため。**
+
+    以前はモジュール直下で `sys.exit(cmd_*())` を並べていた。それだと
+    例外が上がったときに `Guard.run` を通らないので、
+    **落ちても記録に跡が残らない**（誰も気づけない）。
+    2026-09-08、`self-heal` の守備範囲を数えて分かった。"""
+    args = set(sys.argv[1:])
+    if not has_repo():
+        print("  まだ版管理していません。~/.openclaw で git init してください。")
+        return 1
+    if "--save" in args:
+        return cmd_save(force="--force" in args)
+    if "--rollback" in args:
+        return cmd_rollback(quiet="--quiet" in args,
+                            stop_gateway="--stop-gateway" in args)
+    if "--diff" in args:
+        return cmd_diff()
+    if "--log" in args:
+        return cmd_log()
+    return cmd_status()
+
+
+# 読むだけの呼び方。鍵を取らせない。
+G.LOOK_ONLY = Guard.LOOK_ONLY | {"--diff", "--log", "--status"}
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

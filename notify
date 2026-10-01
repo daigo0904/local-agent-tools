@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""notify — Discord に一言送る。
+
+**なぜ専用のコマンドを作ったか。**
+
+2026-09-11、claw が知らせを送ろうとして、2つのやり方で続けて失敗した。
+
+  1. `message` の宛先に `discord_channel_id_here` と書いた。
+     埋める前のプレースホルダをそのまま渡していた。
+     宛先の形を変えて 09-08〜09-11 の4日で 64回。
+  2. 逃げ道の `conversations_send` では、37文字の識別子を写し損ねた。
+     `conv_d62e2cc87ce556ea657d2fae32f8e4de` を
+     `conv_d62e2cc87ce556ea657d2fae3e4`    と書いた（5文字脱落）。
+     26回中 23回。**成功はたった3回。**
+
+**写せない長さのものを「正しく写せ」と指示書に書いても直らない。**
+だから写すものを無くした。打つのは6文字、宛先は書かない。
+
+    notify 本文をそのまま書く
+    echo 本文 | notify
+
+送れなかったぶんは溜めて、次に送れたときに一緒に出す（guardlib の作法）。
+届いたかどうかは終了コードで分かる（0=送った / 1=送れず溜めた）。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard  # noqa: E402
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a not in ("--", "-")]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    text = " ".join(args).strip()
+    if not text and not sys.stdin.isatty():
+        # 長い本文はパイプで渡せる。引数だと引用符の付け方を間違えやすい。
+        text = sys.stdin.read().strip()
+    if not text:
+        print("送る中身がない。 使い方: notify 本文", file=sys.stderr)
+        return 2
+
+    # **訓練中でも送る。**訓練が止めたいのは見張りが出す嘘の警報であって、
+    # 本人に宛てた用件ではない。ここで黙ると、送ったつもりのまま届かない。
+    ok = Guard("notify").notify(text, even_in_drill=True)
+    print("送った。" if ok else "いま送れなかったので溜めた。次に送れるとき一緒に出る。")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

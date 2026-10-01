@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+qwc-guard — qwc が「頼んだら動くか」を確かめる。
+
+1日1回走らせる前提。普段は何もせず、何もしなかったことも報告しない。
+おかしいときと、直ったときだけ Discord に一言送る。
+
+    qwc-guard            確かめる（普段は無言）
+    qwc-guard --report   結果を表示する
+    qwc-guard --check    OK/NG だけ返す
+    qwc-guard --quick    モデルを使わない検査だけ（数秒で終わる）
+
+なぜ他の見張りと形が違うか:
+  model-guard や watchdog が見ている相手は常駐している。だから「立っているのに
+  答えない」を捕まえられる。qwc は頼まれたときだけ動くので、黙っている状態が無い。
+  代わりに見るのは「いま頼んだら、ちゃんと最後まで動くか」。
+
+**この見張りは直せない。**
+  qwc は常駐していないので、蹴り直す相手がいない。できるのは知らせることだけ。
+  直せないものを直せるふりをしないため、ここには復旧の段取りを置いていない。
+
+何を確かめるか:
+  1. 起動する（qwc --version）……… node と依存が壊れていないか
+  2. 実際に1件やらせる ……………… モデル・道具・指示の理解まで通しで
+  3. 書き換えないと言ったら守るか … 頼んでいないことをしない性質そのもの
+  4. qwc-async が起動できるか …… LINE から頼む経路の入り口
+
+3 を入れているのは、ここが壊れると黙って被害が出るため。
+「動くけれど勝手に書き換える」は、動かないより困る。
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+
+# 見張りが共有する部品。同じものを4つに書き写していたが、
+# 書き写した当日に編集で1つ壊し、説明文もずれていた。
+# 独立を支えているのは別プロセス・別の時計・別の判断であって、
+# 同じ文字列を別々に持つことではない。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import Guard, env_value, pulse_age, kickstart, stand_down  # noqa: E402
+
+G = Guard("qwc-guard")
+
+
+ENV_FILE = os.path.expanduser("~/.openclaw/.env")
+
+# 環境変数で差し替えられるのは、壊れたときにちゃんと気づくかを試すため。
+# 見張りは「直った」と嘘をつきうるので、失敗する側も必ず動かして確かめる。
+QWC = os.environ.get("QWC_GUARD_BIN", os.path.expanduser("~/bin/qwc"))
+QWC_ASYNC = os.environ.get("QWC_GUARD_ASYNC", os.path.expanduser("~/bin/qwc-async"))
+
+# 冷えたモデルの読み込みが36秒。道具の往復も入るので、その数倍を見ておく。
+PROBE_TIMEOUT = 240
+# これより遅いと、頼んでも待てない。落ちてはいないので、知らせるだけにする。
+SLOW_SECONDS = 120
+
+MARK = "むらさきいろのかもめ"
+
+
+
+
+
+
+def check_starts():
+    """起動するか。node と依存が壊れていればここで分かる。"""
+    try:
+        r = subprocess.run([QWC, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"起動しない（{type(e).__name__}）", None
+    if r.returncode != 0:
+        return False, f"起動に失敗した (exit {r.returncode})", None
+    return True, r.stdout.strip(), r.stdout.strip()
+
+
+def check_async():
+    """LINE から頼む経路の入り口が動くか。"""
+    if not os.path.exists(QWC_ASYNC):
+        return False, "qwc-async が無い"
+    try:
+        r = subprocess.run([QWC_ASYNC, "--list"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"qwc-async が動かない（{type(e).__name__}）"
+    if r.returncode != 0 or "頼める場所" not in r.stdout:
+        return False, f"qwc-async の返事がおかしい (exit {r.returncode})"
+    return True, "ok"
+
+
+def check_works():
+    """実際に1件やらせる。(通ったか, 説明, かかった秒数)
+
+    書き捨てのフォルダに合言葉を書いたファイルを置き、それを読ませる。
+    合言葉が返事に入っていれば、モデルも道具も指示の理解も通っている。
+    同時に、そのファイルが変わっていないことも見る。
+    **頼んでいないことをしない**という性質は、動くことと同じくらい大事で、
+    ここが壊れると黙って被害が出る。
+    """
+    # **作業場は `/private/tmp` に作る。**既定の `/var/folders/…/T` は
+    # 持ち主でも ACL を付けられない（SIP。`Operation not permitted`）ので、
+    # 別 uid で走る qwc が入れず、**壁の中の qwc をこの見張りが試せない**
+    # （2026-09-14 実測）。`/private/tmp` は 1777 なので誰でも通れる。
+    work = tempfile.mkdtemp(prefix="qwc-guard-", dir="/private/tmp")
+    try:
+        target = os.path.join(work, "hello.txt")
+        with open(target, "w") as f:
+            f.write(f"{MARK}\n")
+        before = open(target).read()
+
+        t0 = time.time()
+        try:
+            r = subprocess.run(
+                [QWC, "-p", "hello.txt に書いてある言葉を、そのまま教えてください。"],
+                capture_output=True, text=True, timeout=PROBE_TIMEOUT, cwd=work)
+        except subprocess.TimeoutExpired:
+            return False, f"{PROBE_TIMEOUT}秒で返事が来なかった", time.time() - t0
+        took = time.time() - t0
+
+        if r.returncode != 0:
+            return False, f"失敗して終わった (exit {r.returncode})", took
+        if MARK not in r.stdout:
+            return False, "ファイルを読めていない（合言葉が返事に無い）", took
+        if open(target).read() != before:
+            return False, "頼んでいないのにファイルを書き換えた", took
+        if os.listdir(work) != ["hello.txt"]:
+            return False, f"頼んでいないファイルを作った（{os.listdir(work)}）", took
+        return True, "ok", took
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def main():
+    args = set(sys.argv[1:])
+    quick = "--quick" in args
+
+    # 手入れ中なら丸ごと見送る。**この見張りの点検は qwc を実際に起動して
+    # 1件やらせる**ので、手入れ中に走ると ollama の列に自分で割り込む。
+    # 待ち行列は1本しかないので、直している側の依頼が数百秒ずれる。
+    held, why = stand_down(G)
+    if held:
+        if "--check" in args:
+            print(f"SKIP {why}")
+        elif "--report" in args:
+            print(f"見送り  {why}")
+        return 0
+
+    state = G.load_state()
+    troubles = []
+
+    started, detail, version = check_starts()
+    if not started:
+        troubles.append(f"qwc が{detail}")
+
+    async_ok, async_detail = check_async()
+    if not async_ok:
+        troubles.append(f"qwc-async: {async_detail}")
+
+    took = None
+    # 起動しないのに「頼んだら動くか」は試せない。試していないことを、
+    # 試したかのように書かない（--quick と同じ文にしていて紛らわしかった）。
+    work_detail = "調べていない（--quick）" if quick else "起動しないので調べていない"
+    if not quick and started:
+        works, work_detail, took = check_works()
+        if not works:
+            troubles.append(f"実際に頼んだら {work_detail}")
+        elif took and took > SLOW_SECONDS:
+            troubles.append(f"遅い（{int(took)}秒）")
+            work_detail = f"通ったが遅い（{int(took)}秒）"
+        else:
+            work_detail = f"通った（{took:.0f}秒）"
+
+    G.beat()
+
+    if troubles:
+        state["fails"] = int(state.get("fails", 0)) + 1
+        state.setdefault("down_since", datetime.now().isoformat(timespec="seconds"))
+        G.save_state(state)
+        G.log("おかしい: " + " / ".join(troubles))
+        # 1回目だけ知らせる。毎回送ると、直すまで鳴り続けることになる。
+        if state["fails"] == 1:
+            G.notify("qwc がうまく動いていません。\n  " + "\n  ".join(troubles)
+                   + "\n直せる相手ではないので、手で見てください（qwc-guard --report）。")
+    else:
+        if state.get("fails"):
+            G.log(f"直った（{version}, {work_detail}）")
+            G.notify(f"qwc が直りました（{version}・{work_detail}）。")
+        G.save_state({"last_ok": datetime.now().isoformat(timespec="seconds"),
+                    "version": version, "seconds": round(took, 1) if took else None,
+                    "fails": 0})
+
+    if "--check" in args:
+        print("NG " + " / ".join(troubles) if troubles else f"OK {version}")
+    elif "--report" in args:
+        print(f"起動      : {detail}")
+        print(f"実際の作業: {work_detail}")
+        print(f"qwc-async : {async_detail}")
+        if troubles:
+            print("\n  ! " + "\n  ! ".join(troubles))
+            print("  この見張りは直せません（qwc は常駐していないため）。手で見てください。")
+
+    return 1 if troubles else 0
+
+
+if __name__ == "__main__":
+    # 落ちても心拍だけは残し、落ちたこと自体は記録して一度だけ知らせる。
+    sys.exit(G.run(main))

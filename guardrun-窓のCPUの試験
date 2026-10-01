@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# guardrun-窓のCPUの試験 — Windows の見届け役が Job Object で CPU 時間を縛り、時間切れを上限として記録するか。
+# 実機が無くても回るよう ctypes を差し替える。書いたのは Codex（2026-09-24・M8）。入れる前に対照で確かめた（直す前の版では落ちる）。
+# **Windows 実機では未検証**: 別利用者での Job 作成・割り当て、CPU 2秒での停止、起こしてから割り当てるまでの一瞬の漏れ。
+"""M8: 実機が無くても、見届け役そのものの分岐を確かめる（2026-09-24）。"""
+import ast
+import builtins
+import ctypes
+import os
+from pathlib import Path
+import stat
+import types
+
+source = Path(__file__).with_name("guardrun.py").read_text()
+tree = ast.parse(source)
+watcher = next(ast.literal_eval(n.value) for n in tree.body
+               if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "_見届け役の中身"
+                       for t in n.targets))
+
+
+class Function:
+    def __init__(self, call):
+        self.call = call
+
+    def __call__(self, *args):
+        return self.call(*args)
+
+
+def run(platform, code=0, ticks=0, fail=None, limit=2):
+    events, lines = [], []
+    state = {"killed": False}
+
+    def api(name, *args):
+        events.append(name)
+        if name == fail:
+            return 0
+        if name == "CreateJobObjectW":
+            return 0x123456789  # 64ビットの HANDLE を切り詰めない。
+        if name == "SetInformationJobObject":
+            assert args[1] == 9
+            info = args[2]._obj
+            assert info.BasicLimitInformation.PerJobUserTimeLimit == limit * 10000000
+            assert info.BasicLimitInformation.LimitFlags == 0x2004
+            assert args[3] == ctypes.sizeof(info)
+        if name == "AssignProcessToJobObject":
+            assert args == (0x123456789, 0x234567890)
+        if name == "QueryInformationJobObject":
+            assert args[1] == 1
+            args[2]._obj.TotalUserTime = ticks
+        return 1
+
+    kernel = types.SimpleNamespace(**{
+        n: Function(lambda *a, name=n: api(name, *a)) for n in
+        ("CreateJobObjectW", "SetInformationJobObject", "AssignProcessToJobObject",
+         "QueryInformationJobObject", "CloseHandle")})
+
+    def dll(*a, **kw):
+        events.append("WinDLL")
+        assert platform == "win32"
+        return kernel
+
+    fake_ct = types.SimpleNamespace(**vars(ctypes))
+    fake_ct.WinDLL = dll
+    fake_ct.WinError = lambda n: OSError(n, "mock failure")
+    fake_ct.get_last_error = lambda: 5
+
+    def popen(*a, **kw):
+        events.append("Popen")
+        return types.SimpleNamespace(
+            _handle=0x234567890, pid=123,
+            wait=lambda: code,
+            kill=lambda: state.update(killed=True))
+
+    def exit_(n):
+        raise SystemExit(n)
+
+    fake_os = types.SimpleNamespace(
+        name="nt" if platform == "win32" else "posix",
+        O_WRONLY=os.O_WRONLY, O_APPEND=os.O_APPEND, O_CREAT=os.O_CREAT,
+        open=lambda *a: 42, fstat=lambda fd: types.SimpleNamespace(st_mode=stat.S_IFREG),
+        write=lambda fd, data: lines.extend(data.decode().splitlines()),
+        fsync=lambda fd: None, close=lambda fd: None)
+    resources = []
+    resource = types.SimpleNamespace(
+        RLIMIT_CPU=0, RLIMIT_FSIZE=1, RLIMIT_NOFILE=2, RLIM_INFINITY=-1,
+        getrlimit=lambda r: (-1, -1),
+        setrlimit=lambda r, value: resources.append((r, value)))
+    modules = {"os": fake_os, "signal": types.SimpleNamespace(),
+               "subprocess": types.SimpleNamespace(Popen=popen),
+               "sys": types.SimpleNamespace(platform=platform, argv=["watcher", "log", "cmd"],
+                                            exit=exit_),
+               "ctypes": fake_ct, "resource": resource}
+
+    def import_(name, *a, **kw):
+        if name == "resource" and platform == "win32":
+            raise ImportError("Windows has no resource")
+        return modules[name] if name in modules else builtins.__import__(name, *a, **kw)
+
+    ns = {"__builtins__": dict(vars(builtins), __import__=import_)}
+    try:
+        exec(compile(watcher.replace("__上限__", repr((limit, 65536, 64)))
+                     .replace("__書ける__", "None"), "watcher", "exec"), ns)
+    except SystemExit as e:
+        status = e.code
+    else:
+        raise AssertionError("見届け役が終了していない")
+    if "WinDLL" in events:
+        assert kernel.CreateJobObjectW.restype is ctypes.c_void_p
+        assert kernel.AssignProcessToJobObject.argtypes == [ctypes.c_void_p] * 2
+    return events, lines, status, state, resources
+
+
+# 終了の突き合わせと hit 判定も、本番の関数を AST からそのまま読む。
+functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+             and n.name in ("_hitを決める", "_記録と終了コードが合うか", "_見届けを読む")]
+ns = {"sys": types.SimpleNamespace(platform="win32"), "_XCPU": None, "_XFSZ": None}
+exec(compile(ast.Module(body=functions, type_ignores=[]), "guardrun", "exec"), ns)
+hit = ns["_hitを決める"]
+
+
+events, lines, status, _, _ = run("win32", 1816, 21000000)
+assert events == ["WinDLL", "CreateJobObjectW", "SetInformationJobObject", "Popen",
+                  "AssignProcessToJobObject", "QueryInformationJobObject", "CloseHandle"]
+assert "終了 -24 cpu 2.10" in lines and status == 152
+ns["stat"] = stat
+ns["os"] = types.SimpleNamespace(
+    O_RDONLY=os.O_RDONLY, open=lambda *a: 42,
+    fstat=lambda fd: types.SimpleNamespace(st_mode=stat.S_IFREG),
+    read=lambda *a: ("\n".join(lines) + "\n").encode(), close=lambda fd: None)
+assert ns["_見届けを読む"]("log") == (True, ("終了", -24, 2.1))
+assert hit(("終了", -24, 2.1), status, None, None, 2, 65536) == "CPU時間の上限（2秒）"
+assert hit(("終了", -24, 2.1), 1, None, None, 2, 65536) is None
+print("PASS: Windows Job の作成・CPU 秒の設定・子の割り当て・時間切れの記録と判定")
+
+for code, ticks in ((0, 0), (1816, 1000000), (5, 21000000)):
+    _, lines, status, _, _ = run("win32", code, ticks)
+    assert status == code and not any(s.startswith("終了 -24") for s in lines)
+    assert hit(("終了", code, ticks / 10000000), code, None, None, 2, 65536) is None
+print("PASS: 通常終了・CPU 未到達の 1816・別の終了コードを CPU 上限と誤認しない")
+
+for name in ("CreateJobObjectW", "SetInformationJobObject", "AssignProcessToJobObject"):
+    events, lines, status, state, _ = run("win32", fail=name)
+    assert status == 127 and "起こせない OSError" in lines
+    assert state["killed"] == (name == "AssignProcessToJobObject")
+    assert ("Popen" in events) == (name == "AssignProcessToJobObject")
+    assert events.count("CloseHandle") == (0 if name == "CreateJobObjectW" else 1)
+events, lines, status, _, _ = run("win32", 1816, 21000000,
+                                 fail="QueryInformationJobObject")
+assert status == 1816 and "CPU計時失敗" in lines and events[-1] == "CloseHandle"
+print("PASS: Job 設定失敗は実行中止・子を回収、計時失敗は上限と断定しない")
+
+for platform in ("linux", "darwin"):
+    events, lines, status, _, resources = run(platform)
+    assert events == ["Popen"] and status == 0 and "終了 0" in lines
+    assert resources == [(0, (2, 4)), (1, (65536, 65536)), (2, (64, 64))]
+events, _, status, _, _ = run("win32", limit=None)
+assert events == ["Popen"] and status == 0
+print("PASS: Linux/Mac は Job API を呼ばず rlimit を維持、CPU 上限なしも Job を作らない")
+print("M8: all tests passed")

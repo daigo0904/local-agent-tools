@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""
+self-heal — 見張りが自分で壊れたとき、qwc に直させて、訓練で合否を出す。
+
+    self-heal            落ちている見張りがあれば1つだけ直す（普段は無言）
+    self-heal --report   いま何が落ちているかを見せる（直さない）
+    self-heal --dry-run  何をするつもりかだけ出す
+
+## 何を直すか
+
+**コードの不具合だけ。**`Guard.run` が traceback を掴んで記録に残したもの——
+つまり「見張り自身が落ちた」場合に限る。
+
+キャッシュの圧・待ち行列の遅延・トンネルの張り替え・SNS の滞留は、
+どれも**運用の状態**であってコードのバグではない。qwc に直させても直らないし、
+直そうとすれば余計に壊す。そちらは `house-brief` が見て、心拍が人に伝える。
+
+## 触ってよい場所
+
+**`~/bin` だけ。**git 管理下なので、間違えたときに戻せる。
+動いているサービス・設定・launchd には触らせない。
+そこは戻す手段が無く、壊れたことに誰も気づけないため。
+
+## なぜ訓練を合格条件にするか
+
+2026-09-08、鍵を土台に移したときに見張りを壊した。気づいたのは
+`guard-drill` を**わざと走らせた**からで、コードを読んで気づいたのではない。
+人が見ていない時間に自動で直させるなら、同じ関門を通させるべきである。
+
+    直す前にコミット → qwc に直させる → guard-drill
+      合格   → そのまま。Discord に「直した」と一言
+      不合格 → **コミットごと戻す。** Discord で人に助けを求める
+
+## やらないこと
+
+- 一度に2つ以上直さない（どちらが原因か分からなくなる）
+- 手入れ中は動かない（`claw hold` を見る）
+- 同じ相手を繰り返し直そうとしない。2回落ちたら人に投げる
+- `~/bin` の外には出ない
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guardlib import DRILL_MARK, Guard, stand_down, 道具の呼び方  # noqa: E402
+
+G = Guard("self-heal")
+BIN = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.expanduser("~/.openclaw/logs")
+
+def watchable():
+    """落ちた跡が記録に残る見張り。**一覧を手で持たない。**
+
+    落ちたことが分かるのは `Guard.run` を通っているものだけ。あれが例外を掴んで
+    「点検の途中で落ちた」と書く。通らないものは落ちても跡が残らないので、
+    ここが見張れる相手ではない。
+
+    手で並べると、`G.run` を外した日から**見えていないものを見ていると言い張る**
+    ことになる。2026-09-08 の時点で `guard-drill` `config-guard` `house-brief` の
+    3本が通っていない（＝この道具の守備範囲の外）。"""
+    out = []
+    for name in sorted(os.listdir(BIN)):
+        path = os.path.join(BIN, name)
+        if not os.path.isfile(path) or "." in name:
+            continue
+        try:
+            with open(path, errors="ignore") as f:
+                if "G.run(main)" in f.read():
+                    out.append(name)
+        except OSError:
+            continue
+    return out
+
+LOOKBACK_HOURS = 6      # どこまで遡って落ちた跡を探すか
+MAX_ATTEMPTS = 2        # 同じ相手にこれ以上は挑まない。人に投げる
+QWC_TIMEOUT = 20 * 60   # qwc に与える時間
+
+
+def crashed():
+    """落ちた跡が記録に残っている見張り。(名前, 最後の行) の一覧。
+
+    `Guard.run` は例外を掴んで「点検の途中で落ちた」と書き、traceback を残す。
+    **それ以外は拾わない。**「直せなかった」「応答しない」は相手の障害であって、
+    この見張り自身のコードの不具合ではない。"""
+    since = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
+    out = []
+    for name in watchable():
+        path = os.path.join(LOG_DIR, f"{name}.log")
+        try:
+            with open(path, errors="ignore") as f:
+                lines = f.read().splitlines()[-400:]
+        except OSError:
+            continue
+        hit = None
+        for i, line in enumerate(lines):
+            if "点検の途中で落ちた" not in line:
+                continue
+            # 訓練中に書かれた行は `[訓練]` が付く。**印を消し忘れても効く**
+            # ように、印を見るのとは別にここでも弾く（二重の備え）。
+            if "[訓練]" in line:
+                continue
+            try:
+                when = datetime.strptime(line[1:20], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if when > since:
+                tail = [l for l in lines[i:i + 12] if l.strip()]
+                # **~/bin の外から走った写しの落ち方は、この家の不具合ではない。**
+                # 2026-09-13、/tmp に置いた写しの guard-drill が落ちて、
+                # その traceback が**本物の記録に書かれた**。self-heal はそれを
+                # 「guard-drill が落ちた」と読み、qwc に4回直させに行った。
+                # 直す相手は ~/bin のコードなので、**そこから走っていない落ち方は見送る**。
+                他所 = [l for l in tail
+                        if 'File "' in l and '/bin/' not in l and BIN not in l]
+                if 他所:
+                    G.log(f"{name}: {when:%H:%M} の落ち方は ~/bin の外から走ったもの"
+                          f"なので見送る（{他所[0].strip()[:60]}）")
+                    continue
+                hit = "\n".join(tail[:12])
+        if hit:
+            out.append((name, hit))
+    return out
+
+
+def git(*args, cwd=BIN):
+    return subprocess.run(["git", *args], cwd=cwd,
+                          capture_output=True, text=True, timeout=120)
+
+
+def drill_passes():
+    """訓練が全部通るか。(通ったか, 説明)。
+
+    **落ちた項目だけでなく、走ったかどうかも見る。**訓練そのものが
+    走らなかったのを「落ちなかった」と読むと、合格の意味が無くなる。"""
+    try:
+        p = subprocess.run(道具の呼び方([os.path.join(BIN, "guard-drill")]),
+                           capture_output=True, text=True, timeout=900)
+    except Exception as e:
+        return False, f"訓練を走らせられなかった（{e}）"
+    out = p.stdout or ""
+    if "項目すべて通りました" in out:
+        return True, "訓練は全部通った"
+    for line in out.splitlines():
+        if "落ちました" in line:
+            return False, line.strip()
+    return False, "訓練が結果を出さなかった（走っていない可能性）"
+
+
+def ask_qwc(name, evidence):
+    """qwc に直させる。返り値は (直したか, 説明)。
+
+    **-p で1回だけ走らせる。**qwc-async は Discord に結果を投げるので、
+    ここから呼ぶと合否が出る前に「直した」と伝わってしまう。"""
+    task = (
+        f"~/bin/{name} が実行中に例外で落ちています。記録の抜粋:\n\n"
+        f"{evidence}\n\n"
+        f"この traceback の原因になっている箇所だけを直してください。"
+        f"ほかの動作は変えないこと。テストや新機能は足さないこと。"
+        f"直したら、何をどう直したかを1〜2文で説明してください。")
+    try:
+        p = subprocess.run(
+            [os.path.join(BIN, "qwc"), "-p", task, "--cwd", BIN,
+             "--yolo", "--quiet-thinking"],
+            capture_output=True, text=True, timeout=QWC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"{QWC_TIMEOUT // 60}分で終わらなかった"
+    except Exception as e:
+        return False, f"qwc を起動できなかった（{e}）"
+    if p.returncode != 0:
+        return False, f"qwc が失敗して終わった（exit {p.returncode}）"
+    return True, (p.stdout or "").strip()[-600:]
+
+
+def 変更されている道():
+    """いま作業ツリーで変わっているファイルの集合。"""
+    out = set()
+    for row in (git("status", "--porcelain").stdout or "").splitlines():
+        p = row[3:].strip().strip('"')
+        if p:
+            out.add(p.split(" -> ")[-1])
+    return out
+
+
+def 戻す(base, 想定, name):
+    """戻る場所へ戻す。**ただし、想定していないものが増えていたら戻さない。**
+
+    2026-09-13、この戻しが**人の作業を3つ消した**。
+    `git add -A` で作業ツリーごと控えを作り、数分後に `reset --hard` するので、
+    **控えを取ったあとに誰かが編集したぶんは、まとめて消える**。
+    消えた3つは、消えたこと自体が誰にも見えなかった
+    （`house-brief` は plist が `--notify` を渡したまま、その引数が無い状態で走り続けた
+    ＝走るが何も知らせない）。
+
+    だから戻す直前にもう一度見て、**qwcが触ったもの以外が増えていたら戻さない**。
+    戻せなかったことは人に投げる。**黙って人の手を消すより、直らないほうがましである。**"""
+    いま = 変更されている道()
+    余計 = いま - set(想定)
+    if 余計:
+        G.log(f"{name}: 戻さなかった（qwc 以外の変更が {len(余計)} 件: "
+              + ", ".join(sorted(余計)[:5]) + "）")
+        return False, ("**戻していません。**控えを取ったあとに、qwc が触っていない変更が"
+                       f"増えています（{', '.join(sorted(余計)[:5])}）。"
+                       f"戻すと、その手を消します。手で見てください: "
+                       f"git -C ~/bin diff {base[:8]}")
+    git("reset", "--hard", base)
+    return True, ""
+
+
+def heal(name, evidence, dry):
+    """1つだけ直す。(結果の文, 人に投げるべきか)。"""
+    if dry:
+        return f"{name} を直しにいくところ（--dry-run なので何もしない）", False
+
+    if git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        return f"{name}: ~/bin が git ではないので、戻せない。直さない", True
+
+    # **人が編集の途中なら、手を出さない。**
+    # ここで `git add -A` すると、他人の書きかけを自分の控えに巻き込み、
+    # 訓練が落ちた時に**その書きかけごと消す**（2026-09-13 に実際にやった）。
+    # 直らないことより、人の手を消すことのほうが悪い。
+    書きかけ = 変更されている道()
+    if 書きかけ:
+        return (f"{name}: 作業ツリーに書きかけが {len(書きかけ)} 件あるので手を出しません"
+                f"（{', '.join(sorted(書きかけ)[:5])}）。"
+                f"記録してから、もう一度落ちれば直しにいきます", False)
+
+    # 戻る場所を作る。**直す前に。**
+    git("add", "-A")
+    git("commit", "-m", f"self-heal の前（{name}）",
+        "--author", "self-heal <noreply@localhost>")
+    base = git("rev-parse", "HEAD").stdout.strip()
+
+    G.log(f"{name} を直しにいく（戻る場所 {base[:8]}）")
+    ok, said = ask_qwc(name, evidence)
+    qwcが触った = 変更されている道()
+    if not ok:
+        戻せた, 言い分 = 戻す(base, qwcが触った, name)
+        return (f"{name}: qwc が直せなかった（{said}）"
+                + ("" if 戻せた else "\n" + 言い分)), True
+
+    if not qwcが触った:
+        戻す(base, set(), name)
+        return f"{name}: qwc は動いたが、何も変えなかった", True
+
+    # **ここが合否。**訓練が落ちたら、直したぶんごと戻す。
+    # 訓練は数分かかる。そのあいだに人が別のファイルを触っていることがあるので、
+    # 戻す直前にもう一度見る（`戻す` の中で見ている）。
+    passed, why = drill_passes()
+    if not passed:
+        戻せた, 言い分 = 戻す(base, qwcが触った, name)
+        G.log(f"{name}: 訓練が落ちた（{why}）" + ("→戻した" if 戻せた else "→戻せなかった"))
+        return (f"{name}: qwc が直したが、**訓練が落ちた**（{why}）"
+                + ("ので戻しました。" if 戻せた else "\n" + 言い分)), True
+
+    git("add", "-A")
+    git("commit", "-m", f"self-heal: {name} を直した",
+        "--author", "self-heal <noreply@localhost>")
+    G.log(f"{name} を直した（訓練は全部通った）")
+    return (f"{name} が落ちていたので直しました。訓練は全部通っています。\n"
+            f"qwc の説明:\n{said[:400]}\n"
+            f"戻すなら: git -C ~/bin reset --hard {base[:8]}", False)
+
+
+def 解く(いま落ちている):
+    """落ちた跡が LOOKBACK_HOURS のあいだ無い相手の「試した回数」と「あきらめた」を消す。
+
+    **消さないと、2回失敗した見張りは二度と直されず、知らせも二度目は出ない。**
+    `tried` は直せたときにしか減らず、`gaveup:<名前>` は tell_once の印なので一度立つと
+    二度と言わない。実際 line-guard は 2026-09-08 22:12 から2週間この状態で、
+    **その間に落ちても誰も直さず、誰も言わなかった。**（2026-09-23 に見つけた）
+
+    解くのは「落ちなくなった」ときだけ。落ち続けている相手は、あきらめたまま人に任せる。"""
+    state = G.load_state()
+    tried = state.get("tried") or {}
+    あきらめ = {k.split(":", 1)[1] for k in state if k.startswith("gaveup:")}
+    消す = sorted((set(tried) | あきらめ) - set(いま落ちている))
+    if not 消す:
+        return []
+    for n in 消す:
+        tried.pop(n, None)
+        state.pop(f"gaveup:{n}", None)
+    state["tried"] = tried
+    G.save_state(state)
+    G.log(f"{LOOKBACK_HOURS}時間落ちていないので数え直す: " + "、".join(消す))
+    return 消す
+
+
+def main():
+    args = set(sys.argv[1:])
+    dry = "--dry-run" in args
+    report = "--report" in args
+
+    held, why = stand_down(G, dry or report)
+    if held:
+        return 0
+
+    # **訓練中は動かない。**guard-drill は毎朝 05:30 に見張りを
+    # **わざと壊して**直るか試す。その壊れを「落ちた」と読んで qwc に
+    # 直させにいくと、訓練が壊したものを本気で直しにかかることになる。
+    if os.path.exists(DRILL_MARK) and not (dry or report):
+        G.log("訓練中なので何もしない")
+        return 0
+
+    found = crashed()
+    if not (dry or report):
+        解く([n for n, _ in found])
+    if report:
+        st = G.load_state()
+        諦め = sorted(k.split(":", 1)[1] for k in st if k.startswith("gaveup:"))
+        試し = st.get("tried") or {}
+        if 諦め or 試し:
+            print("あきらめている相手: " + ("、".join(諦め) or "なし")
+                  + "／試した回数: " + ("、".join(f"{k}={v}" for k, v in 試し.items()) or "なし"))
+            print(f"  （{LOOKBACK_HOURS}時間落ちなければ、次の巡回で数え直す）")
+        cover = watchable()
+        print(f"見張れる相手（{len(cover)}本）: {', '.join(cover)}")
+        blind = [n for n in sorted(os.listdir(BIN))
+                 if os.path.isfile(os.path.join(BIN, n)) and "." not in n
+                 and n not in cover and n.endswith(("guard", "drill", "brief"))]
+        if blind:
+            print(f"  ※ 守備範囲の外（落ちても跡が残らない）: {', '.join(blind)}")
+        print()
+        print("落ちている見張り:" if found else "落ちている見張りはありません")
+        for name, tail in found:
+            print(f"\n  ■ {name}")
+            for line in tail.splitlines()[:6]:
+                print(f"    {line[:110]}")
+        return 0
+
+    if not found:
+        return 0
+
+    state = G.load_state()
+    tried = state.get("tried") or {}
+
+    # **一度に1つだけ。**2つ直すと、訓練が落ちたときにどちらが原因か分からない。
+    name, evidence = found[0]
+    n = int(tried.get(name, 0))
+    if n >= MAX_ATTEMPTS:
+        G.tell_once(state, f"gaveup:{name}",
+                    f"見張り（{name}）が落ちています。**{n}回試しましたが直せませんでした。**\n"
+                    f"手で見てください。\n\n{evidence[:600]}")
+        return 1
+
+    tried[name] = n + 1
+    state["tried"] = tried
+    G.save_state(state)
+
+    text, need_human = heal(name, evidence, dry)
+    if need_human:
+        G.notify(f"⚠ {text}\n\n記録の抜粋:\n{evidence[:500]}")
+        return 1
+    G.notify(f"🔧 {text}")
+    tried.pop(name, None)
+    state["tried"] = tried
+    state.pop(f"gaveup:{name}", None)
+    G.save_state(state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(G.run(main))

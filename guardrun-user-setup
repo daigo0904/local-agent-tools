@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""guardrun-user-setup — 走りを別の uid に移す（壁を「お願い」から「境界」に変える）。
+
+    guardrun-user-setup            いま何が足りないかだけ出す（何も変えない・sudo 不要）
+    guardrun-user-setup --install  作る（**管理者権限が1回だけ必要**）
+    guardrun-user-setup --uninstall 消す
+
+## なぜこれが要るのか（2026-09-12 の実測）
+
+いまの壁は本物だが、**全部「guardrun を通ってくれれば効く」壁**である。
+実際に測った：
+
+    壁の中から受領証に触る    できない（verify の 記録 = ○）
+    **壁の外から受領証に触る  できた。「中断」を「緑」に書き換えられた**
+    guardrun を通さずに走る   できる（`qwc` を直に打てる）
+    掃除を黙らせる            できる（plist は自分のもの）
+
+同じ uid で動いているものは、同じ uid のものを何でも書ける。
+**これは実装の穴ではなく、uid の意味そのもの。**中で頑張っても閉じない。
+
+## 別の uid にすると、何が「お願い」でなくなるか
+
+    受領証の偽造   置き場を人の uid が持ち 700 にする → 書けない（権限で不可能）
+                  **実測（Linux）**: 別 uid からは読みも書きも Permission denied
+    残党          `kill -u` が全部に届く。**自分でグループを作った孫も逃げられない**
+                  **実測（Linux）**: setsid した孫が 1本 → 0本。囲い（bwrap）を
+                  外しても ○ だったので、これは uid の手柄である。
+                  macOS の 残党 ★ を塞ぐ道はこれしか無い
+    掃除を黙らせる 人の LaunchAgents は別 uid からは書けない
+
+**uid では縛れないもの（測って分かった）:**
+
+    通信   uid では止められない。sandbox-exec／bwrap を重ねる
+    場所   /tmp のような誰でも書ける所には書ける（実測で ★ が出た）
+    秘密   **`~` の 750 は守りにならない。**作業場へ辿り着かせるために
+           通り道（search）の穴を開けるので、**名前を知っているファイルは
+           読める**（実測：囮の秘密を 288 バイト 読まれた）。
+           読みの壁は囲いが持つ。重ねれば ○ になる
+
+**だから uid は囲いの代わりではなく、下に敷くもの。**guardrun は
+両方使えるときは自動で重ねる（`別ユーザ + sandbox-exec`）。
+どちらが何を守っているかは verify が1件ずつ答える。
+
+## 作業場はどうするか
+
+`~` が 750 なので、別 uid は作業場にも入れない。**穴は最小で開ける**：
+通り道に `search` だけ、作業場に読み書きを、**走るあいだだけ** ACL で足す
+（APFS で効くことを確認済み）。走りが終わったら外す。
+作業場を家の外へ出す案もあるが、そちらは持ち帰りの手間が増える。
+
+## 消し方
+
+`--uninstall` で元に戻る。ユーザとグループと sudoers の1行だけなので、
+**残るものは無い**。
+"""
+
+import json
+import os
+import platform
+import pwd
+import shutil
+import subprocess
+import sys
+
+def _人を決める():
+    """**誰のために作るのかを取り違えない。**
+
+    2026-09-12 に踏んだ穴：GUI の管理者ダイアログ（osascript の
+    `with administrator privileges`）で上がると、**`SUDO_USER` が無い。**
+    そのため「人＝root」と読み、sudoers に `root ALL=(_guardrun) …` と
+    書いてしまった（35バイト＝daigo ではなく root 宛だったので気づけた）。
+    権限を上げる道を増やすと、**誰が呼んだのかを運ぶ道も増える。**
+    だから明示の `--人` を最優先にして、上がるときは必ず自分で渡す。"""
+    引数 = sys.argv[1:]
+    if "--人" in 引数:
+        i = 引数.index("--人")
+        if i + 1 < len(引数):
+            return 引数[i + 1]
+    return os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+
+
+利用者 = _人を決める()
+名前 = "_guardrun"
+SUDOERS = "/etc/sudoers.d/guardrun"
+
+
+跡 = os.path.join(os.path.expanduser("~" + 利用者), ".guardrun", "setup.log")
+
+
+def 記す(行):
+    """走ったことを残す。**「打った」を確かめられるようにするため。**
+
+    2026-09-12、本人が2回打ったのに1つも作られていなかった。
+    走ったのか・走って落ちたのかを区別する手がかりが**どこにも無かった**
+    （macOS の統一ログは、対照の問い合わせでも0行しか返らず使えなかった）。
+    だから自分で残す。root で走ったときは、あとから人が読めるよう持ち主を戻す。"""
+    try:
+        os.makedirs(os.path.dirname(跡), mode=0o700, exist_ok=True)
+        with open(跡, "a") as f:
+            f.write("[%s] uid=%d %s\n"
+                    % (__import__("time").strftime("%Y-%m-%d %H:%M:%S"),
+                       os.geteuid(), 行))
+        if os.geteuid() == 0:
+            p = pwd.getpwnam(利用者)
+            os.chown(跡, p.pw_uid, p.pw_gid)
+            os.chown(os.path.dirname(跡), p.pw_uid, p.pw_gid)
+    except OSError:
+        pass
+
+
+def 走る(引数, 黙=True):
+    try:
+        p = subprocess.run(引数, capture_output=True, text=True, timeout=60)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return -1, str(e)
+
+
+def 居るか():
+    try:
+        return pwd.getpwnam(名前).pw_uid
+    except KeyError:
+        return None
+
+
+def 空き番():
+    """使われていない uid/gid を1つ。**500 未満（人でない側）から採る。**"""
+    使用中 = set()
+    if platform.system() == "Darwin":
+        _, o = 走る(["dscl", ".", "-list", "/Users", "UniqueID"])
+        for line in o.splitlines():
+            部 = line.split()
+            if len(部) == 2 and 部[1].isdigit():
+                使用中.add(int(部[1]))
+        _, o = 走る(["dscl", ".", "-list", "/Groups", "PrimaryGroupID"])
+        for line in o.splitlines():
+            部 = line.split()
+            if len(部) == 2 and 部[1].isdigit():
+                使用中.add(int(部[1]))
+    else:
+        for p in pwd.getpwall():
+            使用中.add(p.pw_uid)
+    for n in range(450, 500):
+        if n not in 使用中:
+            return n
+    return None
+
+
+def 作る命令(番):
+    """実際に打つ命令。**--check でも全部見せる。**隠して実行しない。"""
+    if platform.system() == "Darwin":
+        d = ["dscl", "."]
+        return [
+            d + ["-create", "/Groups/%s" % 名前],
+            d + ["-create", "/Groups/%s" % 名前, "PrimaryGroupID", str(番)],
+            d + ["-create", "/Groups/%s" % 名前, "RealName", "guardrun agent"],
+            d + ["-create", "/Users/%s" % 名前],
+            d + ["-create", "/Users/%s" % 名前, "UniqueID", str(番)],
+            d + ["-create", "/Users/%s" % 名前, "PrimaryGroupID", str(番)],
+            d + ["-create", "/Users/%s" % 名前, "RealName", "guardrun agent"],
+            d + ["-create", "/Users/%s" % 名前, "UserShell", "/usr/bin/false"],
+            d + ["-create", "/Users/%s" % 名前, "NFSHomeDirectory", "/var/empty"],
+            d + ["-create", "/Users/%s" % 名前, "IsHidden", "1"],
+            d + ["-append", "/Groups/%s" % 名前, "GroupMembership", 名前],
+        ]
+    return [
+        ["groupadd", "--system", "--gid", str(番), 名前],
+        ["useradd", "--system", "--uid", str(番), "--gid", str(番),
+         "--home-dir", "/nonexistent", "--no-create-home",
+         "--shell", "/usr/sbin/nologin", 名前],
+    ]
+
+
+def 消す命令():
+    if platform.system() == "Darwin":
+        return [["dscl", ".", "-delete", "/Users/%s" % 名前],
+                ["dscl", ".", "-delete", "/Groups/%s" % 名前]]
+    return [["userdel", 名前], ["groupdel", 名前]]
+
+
+def sudoers本文():
+    # **下向きの権限だけ。**この1行で増えるのは「より弱い uid になれる」ことだけ。
+    return "%s ALL=(%s) NOPASSWD: ALL\n" % (利用者, 名前)
+
+
+def 点検():
+    ok = True
+    print("機械: %s %s" % (platform.system(), platform.release()))
+    print("人  : %s" % 利用者)
+    uid = 居るか()
+    if uid:
+        print("  ● ユーザ %s は居る（uid %d）" % (名前, uid))
+    else:
+        番 = 空き番()
+        print("  ○ ユーザ %s は居ない（空き番 %s を使う）" % (名前, 番))
+        ok = False
+    家 = os.path.expanduser("~" + 利用者)
+    try:
+        st = os.stat(家)
+        権 = oct(st.st_mode & 0o777)
+        他人に開いている = bool(st.st_mode & 0o005)
+        print("  %s 家の権限 %s（%s）"
+              % ("★" if 他人に開いている else "●", 権,
+                 "別 uid からも入れてしまう" if 他人に開いている
+                 else "別 uid は入れない"))
+        if 他人に開いている:
+            print("      直す: chmod 750 %s" % 家)
+            ok = False
+    except OSError as e:
+        print("  ★ 家が読めない（%s）" % e)
+        ok = False
+    置き場 = os.path.join(家, ".guardrun")
+    if os.path.isdir(置き場):
+        権 = os.stat(置き場).st_mode & 0o777
+        print("  %s 受領証の置き場 %s" % ("●" if 権 == 0o700 else "○", oct(権)))
+        if 権 != 0o700:
+            print("      直す: chmod 700 %s" % 置き場)
+    if os.path.exists(SUDOERS):
+        print("  ● sudoers の1行は入っている（%s）" % SUDOERS)
+    else:
+        print("  ○ sudoers の1行が無い（%s）" % SUDOERS)
+        print("      入れる中身: %s" % sudoers本文().strip())
+        ok = False
+    if uid:
+        code, o = 走る(["sudo", "-n", "-u", 名前, "/usr/bin/true"])
+        print("  %s %s になれるか（合言葉なしで）: %s"
+              % ("●" if code == 0 else "★", 名前,
+                 "なれる" if code == 0 else o.strip()[:60]))
+        if code != 0:
+            ok = False
+    print()
+    if ok:
+        print("そろっています。guardrun 側の 別ユーザ執行 を使えます。")
+    else:
+        print("足りないものがあります。作るには **1回だけ** 管理者権限が要ります:")
+        print("    sudo %s --install" % os.path.abspath(__file__))
+        print()
+        print("そのとき打たれる命令（これで全部・隠しはありません）:")
+        for c in 作る命令(空き番() or 450):
+            print("    " + " ".join(c))
+        print("    （%s に1行）%s" % (SUDOERS, sudoers本文().strip()))
+    return 0 if ok else 1
+
+
+def 入れる():
+    if os.geteuid() != 0:
+        # **`sudo` を人に打たせない。**2026-09-12、本人が3回打ったのに
+        # スクリプトは一度も起動しなかった（跡が1行も増えなかった）。
+        # `sudo` の綴り・絶対パス・`&&` の連結——打つものが増えるほど、
+        # どこで落ちたのか分からなくなる。**自分で上がり直す。**
+        # 合言葉の入力は macOS が出す。ここまでは必ず跡に残っているので、
+        # このあと uid=0 の行が出なければ「合言葉で弾かれた」と分かる。
+        if "--no-elevate" in sys.argv:
+            print("管理者権限が要ります: sudo %s --install"
+                  % os.path.abspath(__file__))
+            return 2
+        本体 = [sys.executable, os.path.abspath(__file__),
+                "--install", "--no-elevate", "--人", 利用者]
+
+        # **端末が無いなら、sudo は使えない。**
+        # `sudo: a terminal is required to read the password` で必ず落ちる。
+        # 2026-09-12、本人が3回打って1度も起動しなかったのはこれ
+        # （跡が1行も増えず、こちらは「打っていない」と読むしかなかった）。
+        # macOS には端末が無くても通る正規の道がある——GUI の管理者ダイアログ。
+        # 画面に出る問いかけは、インストーラが出すものと同じもの。
+        if not sys.stdin.isatty() and platform.system() == "Darwin":
+            記す("端末が無いので GUI の管理者ダイアログで上がる")
+            中身 = " ".join("'%s'" % a.replace("'", "'\\''") for a in 本体)
+            台本 = 'do shell script "%s" with administrator privileges' % (
+                中身.replace("\\", "\\\\").replace('"', '\\"'))
+            try:
+                p = subprocess.run(["osascript", "-e", 台本],
+                                   capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                print("合言葉の入力が5分間ありませんでした")
+                記す("GUI ダイアログが時間切れ")
+                return 2
+            出 = (p.stdout or "") + (p.stderr or "")
+            print(出.strip())
+            記す("GUI 経由の終了コード %d" % p.returncode)
+            return p.returncode
+
+        sudo = shutil.which("sudo")
+        if not sudo:
+            print("sudo が見つかりません")
+            return 2
+        記す("自分で sudo に上がり直す（次に uid=0 の行が出れば通った）")
+        print("管理者の合言葉を聞かれます（このMacのログイン合言葉）:")
+        sys.stdout.flush()
+        os.execvp(sudo, 本体[:1] + [sudo] and
+                  [sudo] + 本体)
+        return 2          # execvp が成功すればここには来ない
+    if 居るか() is None:
+        番 = 空き番()
+        if 番 is None:
+            print("空いている uid が見つかりません（450-499 が埋まっている）")
+            return 1
+        for c in 作る命令(番):
+            code, o = 走る(c)
+            if code != 0:
+                print("失敗: %s\n  %s" % (" ".join(c), o.strip()[:200]))
+                return 1
+        print("  ● ユーザ %s を作りました（uid %d）" % (名前, 番))
+    else:
+        print("  ● ユーザ %s は既に居ます" % 名前)
+
+    置き場 = os.path.join(os.path.expanduser("~" + 利用者), ".guardrun")
+    if os.path.isdir(置き場):
+        os.chmod(置き場, 0o700)
+        print("  ● 受領証の置き場を 700 にしました")
+
+    # **sudoers は必ず検査してから置く。**壊れた行を置くと sudo 自体が死ぬ。
+    仮 = SUDOERS + ".new"
+    with open(仮, "w") as f:
+        f.write(sudoers本文())
+    os.chmod(仮, 0o440)
+    code, o = 走る(["visudo", "-c", "-f", 仮])
+    if code != 0:
+        os.unlink(仮)
+        print("  ★ sudoers の行が通りませんでした: %s" % o.strip()[:150])
+        return 1
+    os.replace(仮, SUDOERS)
+    print("  ● sudoers に1行入れました（%s）" % SUDOERS)
+
+    # **作ったら、その場で効くことを確かめる。ただし人の側で。**
+    # root のまま試すと、sudoers の1行が間違っていても必ず成功する
+    # （root は何にでもなれる）。**確かめる相手を取り違えた検査は、
+    # 嘘をつく検査である**——実際 2026-09-12 に「なれる: はい」と出しながら、
+    # 人の側では `a password is required` だった。
+    if os.geteuid() == 0 and 利用者 != "root":
+        code, o = 走る(["sudo", "-u", 利用者, "sudo", "-n", "-u", 名前,
+                        "/usr/bin/true"])
+        誰 = "%s が %s に" % (利用者, 名前)
+    else:
+        code, o = 走る(["sudo", "-n", "-u", 名前, "/usr/bin/true"])
+        誰 = "%s に" % 名前
+    print("  %s %sなれる: %s" % ("●" if code == 0 else "★", 誰,
+                                 "はい" if code == 0 else o.strip()[:80]))
+    print()
+    print("次: python3 ~/bin/guardrun.py --verify で 残党 が ○ になるか見てください。")
+    return 0 if code == 0 else 1
+
+
+def 消す():
+    if os.geteuid() != 0:
+        print("管理者権限が要ります: sudo %s --uninstall" % os.path.abspath(__file__))
+        return 2
+    for c in 消す命令():
+        走る(c)
+    if os.path.exists(SUDOERS):
+        os.unlink(SUDOERS)
+    print("  ● 消しました（ユーザ・グループ・sudoers の1行）")
+    return 0
+
+
+if __name__ == "__main__":
+    引数 = set(sys.argv[1:])
+    記す("呼ばれた: " + " ".join(sys.argv[1:] or ["（引数なし＝点検）"]))
+    if "--install" in 引数:
+        码 = 入れる()
+        記す("--install 終了コード %d" % 码)
+        sys.exit(码)
+    if "--uninstall" in 引数:
+        码 = 消す()
+        記す("--uninstall 終了コード %d" % 码)
+        sys.exit(码)
+    码 = 点検()
+    記す("点検 終了コード %d" % 码)
+    sys.exit(码)
