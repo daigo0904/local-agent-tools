@@ -1510,7 +1510,42 @@ class Windows別ユーザ(Enforcer):
         except Exception:
             return None
 
+    def _sidをAPIで(self):
+        """**SID は PowerShell を起こさずに引く。**（2026-10-04・fw 版）
+        PowerShell を起こすだけで 0.4〜0.5 秒かかっていた。LookupAccountNameW は µs 単位。
+        **控えない。**利用者を作り直すと SID が変わるので、毎回引く。引けなければ "" を返し、PowerShell の道に任せる。"""
+        try:
+            import ctypes
+            from ctypes import wintypes as W
+            a = ctypes.WinDLL("advapi32", use_last_error=True)
+            k = ctypes.WinDLL("kernel32")
+            a.LookupAccountNameW.argtypes = [W.LPCWSTR, W.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(W.DWORD),
+                                             W.LPWSTR, ctypes.POINTER(W.DWORD), ctypes.POINTER(W.DWORD)]
+            a.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(W.LPWSTR)]
+            k.LocalFree.argtypes = [ctypes.c_void_p]
+            sid = ctypes.create_string_buffer(256)
+            n = W.DWORD(256)
+            dom = ctypes.create_unicode_buffer(256)
+            dn = W.DWORD(256)
+            use = W.DWORD()
+            # 「機械名\利用者」で引く。名前だけだとドメインの同名の人を引き得る
+            名 = "%s\\%s" % (os.environ.get("COMPUTERNAME", "."), self.利用者)
+            if not a.LookupAccountNameW(None, 名, sid, ctypes.byref(n), dom, ctypes.byref(dn), ctypes.byref(use)):
+                return ""
+            文 = W.LPWSTR()
+            if not a.ConvertSidToStringSidW(sid, ctypes.byref(文)):
+                return ""
+            v = 文.value
+            k.LocalFree(文)
+            return v if v and v.startswith("S-1-") else ""
+        except Exception:
+            return ""
+
     def _sid(self):
+        if self._sid値 is None:
+            v = self._sidをAPIで()
+            if v:
+                self._sid値 = v
         if self._sid値 is None:
             o = self._走らす("(New-Object System.Security.Principal.NTAccount('%s'))"
                              ".Translate([System.Security.Principal.SecurityIdentifier])"
@@ -1614,21 +1649,68 @@ class Windows別ユーザ(Enforcer):
         sid = self._sid()
         if not sid:
             return 失敗("Firewall 規則の作成に失敗", "利用者の SID を取得できない")
-        self._規則 = "guardrun-%d" % os.getpid()
-        # **規則が無ければ外へ通信できるので成功が必須。**（2026-09-24）
-        # PowerShell の継続可能なエラーも終了失敗にする。作成途中の失敗でも
-        # 規則が残り得るので、名前は片付けが済むまで消さない。
+        # **規則は常設にし、走りごとには作らず消さない。**（2026-10-04・fw 版）
+        # 作成 1.52 秒＋削除 1.74 秒が1回 約5.8秒の 56% だった。名前に SID を入れるので、
+        # 利用者を作り直して SID が変わると名前も変わり、古い規則に頼ることはない。
+        # **確かめられなければ走らせない。**規則が無ければ外へ通信できる。
+        ok, 要点 = self.常設の規則(sid)
+        if not ok:
+            return 失敗("Firewall 規則の確認に失敗", 要点)
+        return True, ""
+
+    def _netshで確かめる(self, 名):
+        """True＝有効・外向き・遮断で在る／False＝無い・違う／None＝読めない（英語でない・netsh が無い）"""
+        ns = shutil.which("netsh")
+        if not ns:
+            return None
+        try:
+            o = subprocess.run([ns, "advfirewall", "firewall", "show", "rule", "name=" + 名],
+                               capture_output=True, text=True, errors="replace", timeout=30)
+        except Exception:
+            return None
+        欄 = {}
+        for 行 in (o.stdout or "").splitlines():
+            if ":" in 行:
+                k, v = 行.split(":", 1)
+                欄.setdefault(k.strip(), []).append(v.strip())
+        if o.returncode != 0:
+            # 無い（"No rules match"）。英語でなくても終了コードは 1
+            return False
+        if not {"Enabled", "Direction", "Action"} <= set(欄):
+            return None
+        # 同じ名前が複数あれば、全部が正しいことを求める（1つでも無効なら作り直す）
+        return (all(x == "Yes" for x in 欄["Enabled"]) and all(x == "Out" for x in 欄["Direction"])
+                and all(x == "Block" for x in 欄["Action"]))
+
+    def _PowerShellで確かめる(self, 名):
+        o = self._走らす(
+            "$r = @(Get-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue); "
+            "if ($r.Count -ge 1 -and @($r | Where-Object { $_.Enabled -ne 'True' -or "
+            "$_.Direction -ne 'Outbound' -or $_.Action -ne 'Block' }).Count -eq 0) { 'OK' } else { 'NG' }" % 名)
+        return bool(o and o.returncode == 0 and (o.stdout or "").strip() == "OK")
+
+    def 常設の規則(self, sid):
+        名 = "guardrun-外向き-%s" % sid
+        見 = self._netshで確かめる(名)
+        if 見 is None:
+            見 = self._PowerShellで確かめる(名)
+        if 見:
+            return True, ""
+        # 無い・無効・向きが違う → 消して作り直す（1回の PowerShell で）
         o = self._走らす(
             "$ErrorActionPreference = 'Stop'; "
+            "Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue; "
             "New-NetFirewallRule -DisplayName '%s' -Direction Outbound "
             "-Action Block -LocalUser \"D:(A;;CC;;;%s)\" -ErrorAction Stop | Out-Null"
-            % (self._規則, sid))
+            % (名, 名, sid))
         if o is None or o.returncode != 0:
-            要点 = ("PowerShell を実行できない、または実行が中断した" if o is None else
-                    " ".join(((o.stderr or "") + " " + (o.stdout or "")).split())[:600]
-                    or "終了コード %s" % o.returncode)
-            return 失敗("Firewall 規則の作成に失敗", 要点)
-        return True, ""
+            return False, ("PowerShell を実行できない、または実行が中断した" if o is None else
+                           " ".join(((o.stderr or "") + " " + (o.stdout or "")).split())[:600]
+                           or "終了コード %s" % o.returncode)
+        見 = self._netshで確かめる(名)
+        if 見 is None:
+            見 = self._PowerShellで確かめる(名)
+        return (True, "") if 見 else (False, "作り直した規則を確かめられない（%s）" % 名)
 
     def 片付け(self, c, workdir, tmproot):
         for 先 in self._開けた:
@@ -5678,6 +5760,9 @@ def 壁の利用者を作る():
              + ((暖機.stderr if 暖機 else "") or "?").strip()[:200]))
     print("作りました: %s（合言葉は %s）" % (e.利用者, e.合言葉の置き場))
     print("SID: %s" % (e._sid() or "引けません"))
+    if e._sid():
+        ok, 要点 = e.常設の規則(e._sid())
+        print("通信の規則（常設）: %s" % ("在る" if ok else "作れない: " + 要点))
     print("使えるか: %s" % e.使えるか())
     return 0
 
