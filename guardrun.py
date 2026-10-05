@@ -4241,6 +4241,7 @@ try:
 except (OSError, NameError):
     _本体の指紋 = None
 初期資料の上限 = 64 * 1024 * 1024     # 作業場の写しの上限。この家のソースは全部で 4.9MB
+欠落の名前の上限 = 200               # 欠落は先頭この件数だけ名前で残し、残りは「欠落の数」で数える
 _段階の番号 = {}
 
 
@@ -4291,30 +4292,51 @@ def _初期資料を採る(d, workdir):
     t0 = time.time()
     先 = os.path.join(d, "初期資料.tar.gz")
     欠落, 件数, 量 = [], 0, 0
+    # **欠落は名前を全部は持たない。**（2026-10-05）
+    # 家（~）で qwc を打つと、上限を超えた後のファイルが何十万件も「欠落」に名前で並び、
+    # 予告と受領証が1件 181MB になった。guardrun は走るたびに全部の予告を読むので、
+    # それが4件溜まっただけで、別の場所の qwc も証明も読み込みで止まった（実測）。
+    # 名前は先頭 欠落の名前の上限 件まで、残りは数で書く——黙って飛ばさないのは数で守る。
+    # **上限に達したら、それ以上は歩かない。**家じゅうを歩くだけで数分かかる。
+    欠落の数 = [0]
+
+    def 欠く(文):
+        欠落の数[0] += 1
+        if len(欠落) < 欠落の名前の上限:
+            欠落.append(文)
+    打ち切り = None
     try:
         with tarfile.open(先, "w:gz") as tf:
             for 根, dirs, files in os.walk(workdir, followlinks=False):
+                if 打ち切り:
+                    break
                 dirs.sort()
                 for 名 in sorted(dirs) + sorted(files):
+                    if 量 >= 初期資料の上限:
+                        打ち切り = "上限 %dMB に達したので、ここから先（%s 以降）は写していない" % (
+                            初期資料の上限 >> 20, os.path.relpath(os.path.join(根, 名), workdir))
+                        dirs[:] = []
+                        break
                     p = os.path.join(根, 名)
                     相対 = os.path.relpath(p, workdir)
                     try:
                         st = os.lstat(p)
                         if stat.S_ISREG(st.st_mode) and 量 + st.st_size > 初期資料の上限:
-                            欠落.append("%s（上限 %dMB を超える）" % (相対, 初期資料の上限 >> 20))
+                            欠く("%s（上限 %dMB を超える）" % (相対, 初期資料の上限 >> 20))
                             continue
                         tf.add(p, arcname=相対, recursive=False)
                         件数 += 1
                         if stat.S_ISREG(st.st_mode):
                             量 += st.st_size
                     except (OSError, tarfile.TarError) as ex:
-                        欠落.append("%s（%s）" % (相対, type(ex).__name__))
+                        欠く("%s（%s）" % (相対, type(ex).__name__))
         h = hashlib.sha256()
         with open(先, "rb") as f:
             for 塊 in iter(lambda: f.read(1 << 20), b""):
                 h.update(塊)
         結果 = {"取得状態": "取得済み", "参照": 先, "sha256": h.hexdigest(),
-                "件数": 件数, "バイト": 量, "欠落": 欠落,
+                "件数": 件数, "バイト": 量, "欠落": 欠落, "欠落の数": 欠落の数[0],
+                "打ち切り": 打ち切り,
                 "秒": round(time.time() - t0, 3),
                 "持たないもの": ["ACL", "拡張属性", "ハードリンクの対応"]}
     except Exception as ex:                                   # noqa: BLE001
