@@ -1131,6 +1131,19 @@ class 別ユーザ(Enforcer):
                 self._開けた.append((先, 種))
             else:
                 return False, "%s に穴を開けられない（%s）" % (種, 先)
+        # **一時置き場の中を、人が読めるようにする。**（2026-10-05）
+        # agent は HOME をここ（<一時置き場>/中）にされるので、qwc は会話の記録を
+        # 中/.qwythos-code/sessions に 700 で書く。人の側から読めないと、指示ごとの受領証
+        # （~/bin/qwc の見張り）が区切りを取れない（実測: Permission denied）。
+        # 継承する ACL は作られた瞬間にしか付かないので、agent が何か作る前のここで足す。
+        # 足すのは**人が読む権利だけ**——agent を閉じ込める側は何も変わらない。
+        # 一時置き場は走りの終わりに丸ごと消すので、外す処理は要らない。
+        if platform.system() == "Darwin":
+            import pwd
+            人 = pwd.getpwuid(os.getuid()).pw_name
+            subprocess.run(["chmod", "+a", "user:%s allow read,execute,search,readattr,"
+                            "readextattr,readsecurity,file_inherit,directory_inherit" % 人,
+                            tmproot], capture_output=True)
         # **git に「持ち主が違うのは承知の上」と伝える。**
         # uid を分けると repo の持ち主（人）と走る側（agent）がずれるので、
         # git は `fatal: detected dubious ownership` で全部断る（実測）。
