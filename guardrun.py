@@ -4511,6 +4511,39 @@ def 受領証を残す(d, 受領証, 状態="終了"):
     return 受領証
 
 
+記録の全部を読む上限 = 8 * 1024 * 1024
+_軽く拾う数 = ("親pid", "子pid", "子pgid", "始めた", "親の始まり", "親の始まり_起動時計", "機械の起動",
+            "期限", "終わった", "終了コード", "秒")
+_軽く拾う文字 = ("id", "状態", "作業場", "執行", "判定", "始めた時刻", "終わった時刻", "一時置き場")
+
+
+def _軽く読む(path):
+    """大きすぎる予告・受領証は全部を読まず、先頭から判定に要る項目だけ拾う。
+
+    **巨大な1件で guardrun 全体を止めない。**（2026-10-05）家で qwc を打ったとき、初期資料の
+    欠落一覧で予告が1件 181MB になり、走るたびに全部の予告を json.load していたので、
+    別の場所の qwc も証明もデモも読み込みで止まった（4件・1.6GB）。項目は先頭のほうに
+    書かれる（初期資料は後ろ）ので、先頭 1MB から拾えば足りる。拾ったことは印で残す。"""
+    try:
+        if os.path.getsize(path) <= 記録の全部を読む上限:
+            return _読む(path)
+        with open(path, "rb") as f:
+            頭 = f.read(1 << 20).decode("utf-8", "replace")
+    except OSError:
+        return None
+    out = {"_大きすぎて全部は読んでいない": os.path.getsize(path)}
+    for k in _軽く拾う数:
+        m = re.search(r'"%s":\s*(-?[0-9.]+(?:[eE][-+]?[0-9]+)?|null)' % k, 頭)
+        if m and m.group(1) != "null":
+            v = m.group(1)
+            out[k] = float(v) if any(c in v for c in ".eE") else int(v)
+    for k in _軽く拾う文字:
+        m = re.search(r'"%s":\s*"((?:[^"\\]|\\.)*)"' % k, 頭)
+        if m:
+            out[k] = json.loads('"%s"' % m.group(1))
+    return out if len(out) > 1 else None
+
+
 def 記録を読む(根=None, 読めない=None):
     """置き場にある記録を全部読む。→ [(ディレクトリ, 予告, 受領証 or None)]
 
@@ -4528,12 +4561,12 @@ def 記録を読む(根=None, 読めない=None):
     for n in names:
         d = os.path.join(base, n)
         予告の道 = os.path.join(d, "予告.json")
-        約束 = _読む(予告の道)
+        約束 = _軽く読む(予告の道)
         if not 約束:
             if 読めない is not None and os.path.lexists(予告の道):
                 読めない.append((d, "予告が読めない（壊れているか、権限が無い）"))
             continue
-        out.append((d, 約束, _読む(os.path.join(d, "受領証.json"))))
+        out.append((d, 約束, _軽く読む(os.path.join(d, "受領証.json"))))
     return out
 
 
