@@ -4,7 +4,7 @@ import json
 import os
 
 既定の置き場 = os.path.expanduser("~/.qwythos-code/sessions")
-_差し込み = ("You ", "[", "<", "The ", "Your ", "Tool ", "Note:", "System")   # qwc が自動で差し込む注意書き
+_差し込み = ("You ", "[", "<", "The ", "Your ", "Tool ", "Note:", "System", "This ")   # qwc が自動で差し込む注意書き
 
 
 def 流れ(会話):

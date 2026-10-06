@@ -89,8 +89,10 @@ class 窓口(BaseHTTPRequestHandler):
         os.replace(中, ラベルの道)
         self._送る(200, json.dumps({"件数": len(L)}))
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *a):
+        # 届いた操作を残す（ラベルが保存されない原因を見るため・2026-10-06）
+        sys.stderr.write("%s %s\n" % (time.strftime("%H:%M:%S"), fmt % a))
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":
