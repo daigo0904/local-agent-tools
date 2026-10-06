@@ -1,0 +1,47 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>空回りのラベル付け</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#f3f5f4;--fg:#1b2220;--mu:#5d6864;--li:#d3dad7;--ac:#0d6656;--r:#b3261e;--y:#8a6400;--pn:#fff;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#121615;--fg:#e5eae8;--mu:#97a39e;--li:#2d3633;--ac:#5cc4ad;--r:#f08a80;--y:#e0c060;--pn:#1a201e;color-scheme:dark}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 "Hiragino Sans",sans-serif}
+.w{max-width:56rem;margin:0 auto;padding:1rem 16px 6rem;display:flex;flex-direction:column;gap:.8rem}
+.def{background:var(--pn);border:1px solid var(--li);border-radius:6px;padding:.6rem .9rem;font-size:.85rem}
+.def b{color:var(--r)}
+.bar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
+.bar .p{font-family:ui-monospace,monospace;color:var(--mu)}
+.st{display:flex;flex-direction:column;gap:.25rem}
+.h{background:var(--pn);border:1px solid var(--li);border-radius:6px;padding:.45rem .7rem;font-size:.88rem;word-break:break-word}
+.h.u{border-left:4px solid var(--ac);white-space:pre-wrap}
+.h.n{color:var(--mu);font-size:.78rem;white-space:pre-wrap}
+.h.a{border-left:4px solid var(--y);white-space:pre-wrap}
+.h.t{font-family:ui-monospace,monospace;font-size:.8rem;display:grid;grid-template-columns:2.4rem 9rem 1fr;gap:.4rem}
+.h.t .i{color:var(--mu)} .h.t .rv{grid-column:3;color:var(--mu)}
+.h.t.rep{background:color-mix(in srgb,var(--r) 10%,var(--pn))}
+.btns{position:fixed;left:0;right:0;bottom:0;background:var(--pn);border-top:1px solid var(--li);padding:.6rem 16px;display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap}
+button{font:inherit;padding:.45rem 1rem;border-radius:6px;border:2px solid var(--li);background:transparent;color:var(--fg);cursor:pointer}
+button.k{border-color:var(--r);color:var(--r);font-weight:700} button.s{border-color:var(--ac);color:var(--ac);font-weight:700}
+button[aria-pressed=true]{background:color-mix(in srgb,currentColor 15%,transparent)}
+input{font:inherit;padding:.4rem;border:1px solid var(--li);border-radius:6px;background:var(--pn);color:var(--fg);min-width:14rem}
+</style></head><body><div class="w">
+<div class="def"><b>空回り</b>＝頼みを進めない動きを繰り返す（同じファイル・同じコマンドを結果が変わらないのに何度も／頼みと関係ない探索を続ける／道具を呼び続けて何も作らず答えずに終わる）。
+<b style="color:var(--ac)">正常</b>＝回数が多くても毎回進んでいる。<b style="color:var(--mu)">分からない</b>＝表示だけでは判断できない。<br>判断するのは<b>動きだけ</b>。最後の答えが正しいかどうかでは決めない。</div>
+<div class="bar"><button id="prev">← 前</button><span class="p" id="pos"></span><button id="next">次 →</button><span class="p" id="done"></span></div>
+<div class="st" id="st"></div></div>
+<div class="btns"><button class="k" data-l="空回り">1 空回り</button><button class="s" data-l="正常">2 正常</button><button data-l="分からない">3 分からない</button><input id="memo" placeholder="メモ（任意）"><button id="clear">付け直す</button></div>
+<script>
+let 候補=[],ラベル={},i=0;
+const $=s=>document.querySelector(s);
+function el(t,c,txt){const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e}
+async function 読む(){const r=await (await fetch('/api/list')).json();候補=r.候補;ラベル=r.ラベル;i=候補.findIndex(x=>!ラベル[x]);if(i<0)i=0;見せる()}
+async function 見せる(){const id=候補[i];$('#pos').textContent=(i+1)+' / '+候補.length;$('#done').textContent='付けた '+Object.keys(ラベル).filter(k=>候補.includes(k)).length+' 件';
+ const d=await (await fetch('/api/s?id='+encodeURIComponent(id))).json();const st=$('#st');st.replaceChildren();const seen={};let n=0;
+ for(const h of d.手){if(h.種==='頼み')st.append(el('div','h u','頼み：'+h.文));else if(h.種==='注意書き')st.append(el('div','h n','（qwc が差し込んだ注意書き）'+h.文.slice(0,160)));else if(h.種==='答え')st.append(el('div','h a','答え：'+h.文));
+  else{n++;const k=h.名+'|'+h.引数;const e=el('div','h t');e.append(el('span','i','#'+n),el('span','',h.名),el('span','',h.引数||''));if(h.返り)e.append(el('span','rv','→ '+h.返り));st.append(e)}}
+ const L=ラベル[id];document.querySelectorAll('[data-l]').forEach(b=>b.setAttribute('aria-pressed',String(!!L&&L.ラベル===b.dataset.l)));$('#memo').value=L?L.メモ:'';window.scrollTo(0,0)}
+async function 付ける(l){const id=候補[i];const r=await fetch('/api/label',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,ラベル:l,メモ:$('#memo').value})});
+ if(r.ok){if(l)ラベル[id]={ラベル:l,メモ:$('#memo').value};else delete ラベル[id];if(l&&i<候補.length-1)i++;見せる()}}
+document.querySelectorAll('[data-l]').forEach(b=>b.onclick=()=>付ける(b.dataset.l));
+$('#clear').onclick=()=>付ける(null);$('#prev').onclick=()=>{if(i>0){i--;見せる()}};$('#next').onclick=()=>{if(i<候補.length-1){i++;見せる()}};
+document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT')return;if(e.key==='1')付ける('空回り');if(e.key==='2')付ける('正常');if(e.key==='3')付ける('分からない');if(e.key==='ArrowLeft')$('#prev').click();if(e.key==='ArrowRight')$('#next').click()});
+読む();
+</script></body></html>
