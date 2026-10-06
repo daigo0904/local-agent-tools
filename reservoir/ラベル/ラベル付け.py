@@ -29,6 +29,11 @@ def ラベルたち():
 
 
 def 見せる形(sid):
+    from 会話用に並べる import 伏せる
+    return json.loads(伏せる(json.dumps(_見せる形(sid), ensure_ascii=False)))
+
+
+def _見せる形(sid):
     d = json.load(open(os.path.join(既定の置き場, sid + ".json"), encoding="utf-8"))
     手 = []
     返り = {}
