@@ -131,6 +131,18 @@ def 素で走る(引数):
 
 指示ごとの置き場 = os.path.expanduser("~/.guardrun/指示ごと")
 約束 = []          # `--変えない a,b` で宣言した「変えてはいけない」ファイル（作業場からの相対）
+拾った約束 = []    # そのうち、-p の頼みの文から拾ったもの（受領証の宣言者に名前で残す）
+
+
+def 宣言者():
+    """受領証に「どこから来た約束か」を名前つきで残す。画面はこれを読んで出どころを示す。"""
+    明示 = [x for x in 約束 if x not in 拾った約束]
+    部 = []
+    if 拾った約束:
+        部.append("頼みの文から拾った: %s" % "・".join(拾った約束))
+    if 明示:
+        部.append("--変えない: %s" % "・".join(明示))
+    return "qwc（%s）" % "／".join(部)
 
 
 def 頼みから拾う(文):
@@ -658,7 +670,7 @@ def 囲いなしで走る(g, 引数):
     見張り = 指示ごとの見張り(g, 作業場).始める()
     try:
         r = g.run([node, 本体] + 引数, 作業場,
-                  期待=({"変えない": 約束} if 約束 else None), 宣言者="qwc（--変えない・頼みの文から拾った約束）" if 約束 else None,
+                  期待=({"変えない": 約束} if 約束 else None), 宣言者=宣言者() if 約束 else None,
                   enforcer=g.素通し(), require=g.嘘と沈黙だけ, prove=True,
                   wall_sec=時間, cpu_sec=時間,
                   max_file_bytes=8 * 1024 ** 3, max_add_bytes=50 * 1024 ** 3, max_add_files=200_000,
@@ -669,7 +681,7 @@ def 囲いなしで走る(g, 引数):
 
 
 def main():
-    global 約束
+    global 約束, 拾った約束
     引数 = sys.argv[1:]
     if "--受領証" in 引数:
         return 受領証を並べる()
@@ -683,6 +695,7 @@ def main():
             拾った = 頼みから拾う(引数[引数.index(旗) + 1])
             if 拾った:
                 print("頼みの文から拾った約束: %s は変えない" % "・".join(拾った), file=sys.stderr)
+                拾った約束 = [x for x in 拾った if x not in 約束]
                 約束 = list(dict.fromkeys(約束 + 拾った))
     # **既定は壁なし（PC 全体を触れる）。壁は `--壁` で名指ししたときだけ。**（2026-10-05・本人決定）
     # 9/14 に既定を壁にしたが、壁の中では家の他の場所を触れず、本人の日常の用途
@@ -785,7 +798,7 @@ def main():
 
 def 壁の中で走る(g, node, 引数, 作業場):
     return g.run([node, 本体] + 引数, 作業場,
-              期待=({"変えない": 約束} if 約束 else None), 宣言者="qwc（--変えない・頼みの文から拾った約束）" if 約束 else None,
+              期待=({"変えない": 約束} if 約束 else None), 宣言者=宣言者() if 約束 else None,
               net_allow=["localhost:11434"],
               # qwc 自身の作業記録だけは家の中に置かせる（--resume が要る）。
               # **鍵のある ~/.qwythos-code/.env は含めない。**
