@@ -35,9 +35,13 @@ class ESN:
         self.Wout = np.linalg.solve(A, X.T @ Y).T
         return self
 
-    def 予測(self, 状態):
-        """→ 次の1手の確率（ソフトマックス）。"""
-        z = np.hstack([np.ones((len(状態), 1)), 状態]) @ self.Wout.T
+    def 出力(self, 状態):
+        """読み出しの生の値（確率にする前）。"""
+        return np.hstack([np.ones((len(状態), 1)), 状態]) @ self.Wout.T
+
+    def 予測(self, 状態, 温度=4.0):
+        """→ 次の1手の確率（ソフトマックス）。温度は実験1では 4.0 に固定、実験1'では検証用で決める。"""
+        z = self.出力(状態)
         z = z - z.max(axis=1, keepdims=True)
-        p = np.exp(z * 4.0)                                  # 線形出力を確率にするための温度（試す前に固定）
+        p = np.exp(z * 温度)
         return p / p.sum(axis=1, keepdims=True)
