@@ -45,3 +45,41 @@ class ESN:
         z = z - z.max(axis=1, keepdims=True)
         p = np.exp(z * 温度)
         return p / p.sum(axis=1, keepdims=True)
+
+
+class ロジスティック読み出し:
+    """読み出しを、確率を当てる学び方（ソフトマックス＋交差エントロピー＋L2）で学ぶ。
+
+    線形回帰の読み出しは確率の較正が苦手で、実験1・1'で「自信を持って外す」が出た（対数損失で対照に負けた）。
+    学び方の手順（Adam・学習率0.05・500回・0から）は実験1''で走らせる前に固定した。"""
+
+    def __init__(self, λ=1e-3, 学習率=0.05, 回数=500):
+        self.λ, self.lr, self.回数 = λ, 学習率, 回数
+        self.W = None
+
+    def 覚える(self, X, y, V):
+        X = np.hstack([np.ones((len(X), 1)), X])
+        n, d = X.shape
+        W = np.zeros((d, V))
+        Y = np.eye(V)[y]
+        m = np.zeros_like(W)
+        v = np.zeros_like(W)
+        b1, b2, ε = 0.9, 0.999, 1e-8
+        for t in range(1, self.回数 + 1):
+            z = X @ W
+            z -= z.max(axis=1, keepdims=True)
+            p = np.exp(z)
+            p /= p.sum(axis=1, keepdims=True)
+            g = X.T @ (p - Y) / n
+            g[1:] += self.λ * W[1:]                          # 定数項には L2 を掛けない
+            m = b1 * m + (1 - b1) * g
+            v = b2 * v + (1 - b2) * g * g
+            W -= self.lr * (m / (1 - b1 ** t)) / (np.sqrt(v / (1 - b2 ** t)) + ε)
+        self.W = W
+        return self
+
+    def 予測(self, X):
+        z = np.hstack([np.ones((len(X), 1)), X]) @ self.W
+        z -= z.max(axis=1, keepdims=True)
+        p = np.exp(z)
+        return p / p.sum(axis=1, keepdims=True)
