@@ -29,8 +29,14 @@ def ラベルたち():
 
 
 def 見せる形(sid):
+    """秘密らしい文字列を、文字列の値ごとに伏せる（JSON の文字列にまとめて掛けると引用符まで飲み込んで壊れる）。"""
     from 会話用に並べる import 伏せる
-    return json.loads(伏せる(json.dumps(_見せる形(sid), ensure_ascii=False)))
+    d = _見せる形(sid)
+    for h in d["手"]:
+        for k, v in list(h.items()):
+            if isinstance(v, str) and k != "種":
+                h[k] = 伏せる(v)
+    return d
 
 
 def _見せる形(sid):
