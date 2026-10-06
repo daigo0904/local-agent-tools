@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""qwc — 既定で壁の中で走らせる。逃げ道は `--壁なし`。
+"""qwc — 既定は壁なし（PC 全体を触れる）＋受領証。`--壁` で壁の中に入れる。
 
-    qwc                      対話。壁の中で動く
-    qwc -p "テストを直して"    一回だけ。壁の中で動く
-    qwc --依存 -p "…"         先に壁の外で npm install してから走らせる
-    qwc --作業場 <道> -p "…"   作業場を指定する
+    qwc                      対話。壁なし（PC 全体）。受領証はいまのフォルダの中だけを見る
+    qwc -p "テストを直して"    一回だけ。壁なし＋受領証
+    qwc --壁なし …            guardrun も通さない（受領証なし・証明の待ちもなし）
+    qwc --壁                 対話。壁の中（いまのフォルダだけ・受領証が残る）
+    qwc --壁 -p "…"           一回だけ。壁の中
+    qwc --壁 --依存 -p "…"     先に壁の外で npm install してから壁の中で走らせる
+    qwc --壁 --作業場 <道>      作業場を指定する
     qwc --受領証              最近の受領証を並べる
-    qwc --壁なし …            **壁を通さない**（今までどおり）
+    qwc --変えない app.py,tests/  変えてはいけないファイル（/ で終われば下全部）を宣言する。
+                             変わったら受領証が「約束違反」と言う（指示ごとの受領証も）
+
+**2026-10-05 に既定を壁なしへ戻した（本人決定）。**下の「なぜ既定を壁にするのか」は
+9/14〜10/4 の判断の記録として残す。
 
 ## なぜ既定を壁にするのか
 
@@ -43,6 +50,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 本体 = os.path.expanduser("~/コーディングCLI/bin/qwc.mjs")
 記録の場所 = os.path.expanduser("~/.qwythos-code")
@@ -120,12 +129,570 @@ def 素で走る(引数):
     os.execvp(node, [node, 本体] + 引数)
 
 
+指示ごとの置き場 = os.path.expanduser("~/.guardrun/指示ごと")
+約束 = []          # `--変えない a,b` で宣言した「変えてはいけない」ファイル（作業場からの相対）
+
+
+def 頼みから拾う(文):
+    """頼みの文（人の言葉）から「変えないで」の約束を拾う（~/bin/約束を拾う.py）。読めなければ []。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "約束を拾う", os.path.join(os.path.dirname(os.path.abspath(__file__)), "約束を拾う.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.拾う(文)
+    except Exception:                                  # noqa: BLE001
+        return []
+
+
+def 約束と照らす(g, 差分, 約=None):
+    """約束と差分を、guardrun の 照合する（受領証と同じ判定）で突き合わせる。
+
+    名前だけの約束（app.py）は、下の階層の同じ名前（qwc作業場/app.py）にも当てる——家で打つと
+    変わった場所は家からの道で記録されるので、そのままでは約束が当たらない。"""
+    約 = 約束 if 約 is None else 約
+    if not 約:
+        return {"結果": "未宣言", "食い違い": [], "見た項目": []}
+    r = g.照合する({"結果": {"変えない": 約}}, {"差分": 差分})
+    名前だけ = [x for x in 約 if "/" not in x]
+    for 種, 語 in (("追加", "足された"), ("削除", "消された"), ("変更", "変えられた")):
+        for x in (差分 or {}).get(種) or []:
+            p = x.get("path") if isinstance(x, dict) else str(x)
+            if p in 約 or not any(p.endswith("/" + n) for n in 名前だけ):
+                continue
+            文 = "変えない約束: %s が%s" % (p, 語)
+            if 文 not in r["食い違い"]:
+                r["食い違い"].append(文)
+    if r["食い違い"]:
+        r["結果"] = "不一致"
+    return r
+
+
+class 指示ごとの見張り:
+    """会話の qwc で、**指示が1つ終わるたびに受領証を1枚書く。**（2026-10-05・本人の要望）
+
+    会話の qwc は立ち上げから終了までが guardrun の1回の走りなので、受領証は終了時に1枚しか出ない。
+    qwc 本体（改造は凍結）は触らず、外から区切りを取る: qwc は指示を1つ処理し終えるたびに
+    会話の記録（~/.qwythos-code/sessions/<id>.json）を書き出す（agent.mjs の finally で onSave）。
+    実測で、2つ指示すると記録は2回（やりとり 4件→8件）書き換わった。
+    書き換わった瞬間＝指示が終わった瞬間とみなし、前の指示が終わったときの作業場と今を
+    guardrun の snapshot → diff → verdict（掃除役と同じ）で見比べる。
+
+    置き場は ~/.guardrun/指示ごと/<走りの id>/<番号>.json。--壁 のときは guardrun の記録の根の下なので
+    AI からは読めも書けもしない。壁なし（素通し）のときは AI と同じ利用者なので守られていない。
+    **ここで何が壊れても qwc 本体は止めない**（見張りの失敗は黙って諦める＝受領証が減るだけ）。"""
+
+    def __init__(self, g, 作業場):
+        self.g = g
+        self.作業場 = os.path.realpath(作業場)
+        self.始め = time.time()
+        self.前 = None
+        self.前の時刻 = self.始め
+        self.記録 = None
+        self.記録の更新 = 0
+        self.件数 = 0
+        self.番号 = 0
+        self.走り = None
+        self.止める = threading.Event()
+
+    def 始める(self):
+        try:
+            self.前 = self.g.snapshot(self.作業場)
+        except Exception:                                  # noqa: BLE001
+            return self
+        threading.Thread(target=self._回す, daemon=True).start()
+        return self
+
+    def _記録を探す(self):
+        # 壁の中の qwc は HOME が走りごとの一時置き場（<一時置き場>/中）に差し替わり、会話の記録も
+        # そこに書く（終われば片付けで消える）。予告に一時置き場が書かれていれば、そちらも探す。
+        場所 = [os.path.join(記録の場所, "sessions")]
+        # 予告は走り出しに書かれ、一時置き場は証明のあとで書き足される（予告を更新）。
+        # 早く掴んだ予告を使い続けると、証明を取り直す回だけ記録を探せない（実測で 0 枚）。
+        if not (self.走り or {}).get("一時置き場"):
+            self.走り = self._走りを探す()
+        仮 = (self.走り or {}).get("一時置き場")
+        if 仮:
+            場所.insert(0, os.path.join(仮, "中", ".qwythos-code", "sessions"))
+        候補 = []
+        for 置き場 in 場所:
+            候補 += glob.glob(os.path.join(置き場, "*.json"))
+        for p in sorted(候補, key=os.path.getmtime, reverse=True)[:8]:
+            if os.path.getmtime(p) < self.始め:
+                break
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if os.path.realpath(d.get("root") or "") == self.作業場:
+                return p
+        return None
+
+    def _走りを探す(self):
+        for d in sorted(glob.glob(os.path.expanduser("~/.guardrun/runs/*/予告.json")), reverse=True)[:10]:
+            try:
+                with open(d, encoding="utf-8") as f:
+                    y = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if os.path.realpath(y.get("作業場") or "") == self.作業場 and (y.get("始めた") or 0) >= self.始め - 5:
+                return y
+        return None
+
+    def _回す(self):
+        while not self.止める.wait(1.0):
+            try:
+                self.一度見る()
+            except Exception:                              # noqa: BLE001
+                pass
+
+    def 一度見る(self):
+        if self.記録 is None:
+            self.記録 = self._記録を探す()
+            if self.記録 is None:
+                return
+        t = os.path.getmtime(self.記録)
+        if t == self.記録の更新:
+            return
+        self.記録の更新 = t
+        with open(self.記録, encoding="utf-8") as f:
+            msgs = json.load(f).get("messages") or []
+        if len(msgs) <= self.件数:
+            return
+        新 = msgs[self.件数:]
+        self.件数 = len(msgs)
+        文 = lambda m: m.get("content") if isinstance(m.get("content"), str) else ""
+        指示 = next((文(m) for m in 新 if m.get("role") == "user" and 文(m).strip()), "")
+        返事 = next((文(m) for m in reversed(新) if m.get("role") == "assistant" and 文(m).strip()), "")
+        拾った = 頼みから拾う(指示)
+        約 = list(dict.fromkeys(list(約束) + 拾った))
+        後 = self.g.snapshot(self.作業場)
+        差分 = self.g.diff(self.前, 後)
+        印, 理由 = self.g.verdict(差分)
+        if not self.走り:
+            self.走り = self._走りを探す() or {}
+        親 = self.走り.get("id") or "壁なし-%d" % int(self.始め)
+        self.番号 += 1
+        今 = time.time()
+        d = os.path.join(指示ごとの置き場, 親)
+        os.makedirs(d, exist_ok=True)
+        受 = {"id": "%s-%d" % (親, self.番号), "親": 親, "番号": self.番号,
+              "作業場": self.作業場, "執行": self.走り.get("執行"), "命令": self.走り.get("命令") or [],
+              "指示": 指示, "AIの返事": 返事, "始めた": self.前の時刻, "終わった": 今,
+              "終わった時刻": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(今)),
+              "秒": round(今 - self.前の時刻, 1), "差分": 差分, "判定": 印, "理由": 理由,
+              "約束": 約, "拾った約束": 拾った, "照合": 約束と照らす(self.g, 差分, 約),
+              "見方": "前の指示が終わったとき（1つ目は立ち上げ時）の作業場と、この指示が終わったときを、"
+                      "guardrun の snapshot・diff・verdict で見比べた"}
+        中 = os.path.join(d, ".%d.json.書きかけ" % self.番号)
+        with open(中, "w", encoding="utf-8") as f:
+            json.dump(受, f, ensure_ascii=False, indent=1)
+        os.replace(中, os.path.join(d, "%d.json" % self.番号))
+        self.前, self.前の時刻 = 後, 今
+
+    def 終える(self):
+        self.止める.set()
+        try:
+            self.一度見る()        # 最後の指示（/exit の直前）を取りこぼさない
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+家の雑音 = ("Library/", ".openclaw/", ".qwythos-code/", ".guardrun/", ".guardrun-verify/",
+          ".claude/", ".codex/", ".ollama/", ".Trash/", ".cache/", ".npm/", ".zsh_sessions/",
+          ".zsh_history", ".cc-nosleep/", ".qwc家の証明")
+
+
+def _家の雑音か(相対):
+    return 相対 == "." or 相対.endswith(".DS_Store") or any(
+        相対 == x.rstrip("/") or 相対.startswith(x) for x in 家の雑音)
+
+
+class 家モード:
+    """**家で `qwc` を打ったときの受領証。**（2026-10-05・本人の決定）
+
+    家は受領証の置き場（~/.guardrun）を含むので、guardrun は作業場として断る（正しい）。
+    そこで guardrun の走りにはせず、次の3つで受領証を出す:
+      1. qwc を sandbox に入れる。**~/.guardrun と ~/.guardrun-verify への書き込みだけ禁止**、
+         ほかは全部許す（PC 全体は今までどおり触れる）。受領証の置き場は OS が断る。
+      2. 変わったものは見比べず、**OS の変更通知（FSEvents）**で受け取る。待ちが増えない。
+         何もしない60秒の通知は152件で全部雑音（~/Library・~/.openclaw）だった（実測）ので、
+         家の雑音 は数えない。除いたことは受領証に書く。
+      3. 立ち上げのたびに約0.1秒で確かめる（禁止の場所に書けないか・普通の場所には書けるか・
+         通知が届くか）。**確かめられなければ受領証なしで立ち上げ、そう言う。**
+    持たないもの: 誰が変えたか（AI もブラウザも同じ daigo で動く）・家の雑音の中の変化。"""
+
+    執行 = "家モード（sandbox: 受領証の置き場への書き込みだけ禁止）"
+
+    def __init__(self, g):
+        self.g = g
+        self.家 = os.path.realpath(os.path.expanduser("~"))
+        self.規則 = None
+        self.見張り = None
+
+    def 確かめる(self):
+        """→ (通ったか, わけ)。全部で約0.1〜1秒。"""
+        import tempfile
+        禁止 = [os.path.join(self.家, ".guardrun"), os.path.join(self.家, ".guardrun-verify")]
+        for d in 禁止:
+            os.makedirs(d, exist_ok=True)
+        規則 = "(version 1)\n(allow default)\n(deny file-write* %s)\n" % " ".join(
+            '(subpath "%s")' % d for d in 禁止)
+        fd, 道 = tempfile.mkstemp(suffix=".sb")
+        with os.fdopen(fd, "w") as f:
+            f.write(規則)
+        self.規則 = 道
+        試し = os.path.join(self.家, ".guardrun", ".家の証明")
+        普通 = os.path.join(self.家, ".qwc家の証明")
+        for p in (試し, 普通):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        # 見張りを先に立てて、普通の場所への書き込みが通知で届くかも見る
+        self.見張り = _家の見張り(self.g, self.家).始める()
+        if self.見張り.取得状態 != "取得済み":
+            return False, "変更の通知を受け取れない（%s）" % self.見張り.取得状態
+        sb = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+        r1 = subprocess.run([sb, "-f", 道, "/bin/sh", "-c", 'echo x > "$1"', "sh", 試し],
+                            capture_output=True)
+        if r1.returncode == 0 or os.path.exists(試し):
+            return False, "受領証の置き場に書けてしまった（sandbox が効いていない）"
+        r2 = subprocess.run([sb, "-f", 道, "/bin/sh", "-c", 'echo x > "$1" && rm "$1"', "sh", 普通],
+                            capture_output=True)
+        if r2.returncode != 0:
+            return False, "普通の場所に書けない（sandbox が強すぎる）: %s" % r2.stderr.decode(errors="replace")[:80]
+        for _ in range(40):
+            if self.見張り.届いた(".qwc家の証明"):
+                break
+            time.sleep(0.025)
+        else:
+            return False, "書き込みの通知が1秒以内に届かなかった"
+        self.見張り.区切る()
+        return True, "確かめた"
+
+    def 走る(self, 引数):
+        import signal
+        node = shutil.which("node") or "/opt/homebrew/bin/node"
+        sb = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+        指示 = 家の指示ごと(self).始める()
+        def 子の前():
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        元 = signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl+C は qwc に任せる
+        try:
+            p = subprocess.run([sb, "-f", self.規則, node, 本体] + 引数, preexec_fn=子の前)
+            code = p.returncode
+        finally:
+            signal.signal(signal.SIGINT, 元)
+            指示.終える()
+            try:
+                os.unlink(self.規則)
+            except OSError:
+                pass
+        全体 = 指示.全体()
+        print()
+        print("── 受領証（家モード）%s 指示 %d 回・変わったファイル %d" %
+              ({"緑": "●", "青": "○", "赤": "✗"}.get(全体["判定"], "?"), 指示.番号, 全体["数"]))
+        for k in ("追加", "変更", "削除"):
+            for x in 全体["差分"][k][:15]:
+                print("   %s %s" % (k, x["path"]))
+        if 約束:
+            照 = 約束と照らす(self.g, 全体["差分"])
+            print("   %s" % ("✗ 約束違反: " + " / ".join(照["食い違い"]) if 照["結果"] == "不一致"
+                             else "○ 変えない約束（%s）は守られた" % "・".join(約束)))
+        print("   ・数えていない場所: ~/Library・~/.openclaw・~/.qwythos-code など（アプリが勝手に書く所）")
+        print("   ・誰が変えたかは区別できない（AI以外のアプリの変更も載る）")
+        if 指示.番号:
+            print("   %s" % os.path.join(指示ごとの置き場, 指示.親))
+        return code
+
+
+class _家の見張り:
+    """guardrun の FSEvents の見張りに、家の雑音を数えない口を足したもの。"""
+
+    def __new__(cls, g, 家):
+        基 = g._出来事の見張り
+
+        class 見張り(基):
+            def _受ける(self, _s, _i, n, 道々, 印々, _ids):
+                import ctypes
+                arr = ctypes.cast(道々, ctypes.POINTER(ctypes.c_char_p))
+                with self._鍵:
+                    for k in range(n):
+                        p = arr[k].decode("utf-8", "surrogateescape")
+                        fl = 印々[k]
+                        if not p.startswith(self.根 + "/"):
+                            continue
+                        相対 = os.path.relpath(p, self.根)
+                        種 = [名 for b, 名 in self._印.items() if fl & b]
+                        if not 種:
+                            continue
+                        if 相対 == ".qwc家の証明":
+                            self._証明が届いた = True
+                        if _家の雑音か(相対):
+                            continue
+                        if len(self.出来事) < 200000:
+                            self.出来事.append({"秒": round(time.monotonic() - self._t0, 4),
+                                                "時刻": time.time(), "path": 相対, "種": 種})
+                        else:
+                            self.上限で省略 += 1
+
+            def 届いた(self, _名):
+                return getattr(self, "_証明が届いた", False)
+
+            def 区切る(self):
+                with self._鍵:
+                    self.出来事 = []
+
+            def 取り出す(self, 先頭):
+                with self._鍵:
+                    return list(self.出来事[先頭:]), len(self.出来事)
+
+        return 見張り(家)
+
+
+class 家の指示ごと(指示ごとの見張り):
+    """家モードの指示ごとの受領証。区切りは 指示ごとの見張り と同じ（会話の記録の書き換わり）、
+    中身は見比べではなく、その指示の間に届いた変更の通知から作る。"""
+
+    def __init__(self, 家):
+        super().__init__(家.g, 家.家)
+        self.家モード = 家
+        self.親 = "家-%d" % int(self.始め)
+        self.読んだ = 0
+        self.全部 = {}
+
+    def 始める(self):
+        threading.Thread(target=self._回す, daemon=True).start()
+        return self
+
+    def _記録を探す(self):
+        for p in sorted(glob.glob(os.path.join(記録の場所, "sessions", "*.json")),
+                        key=os.path.getmtime, reverse=True)[:5]:
+            if os.path.getmtime(p) < self.始め:
+                break
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if os.path.realpath(d.get("root") or "") == self.作業場:
+                return p
+        return None
+
+    def _差分(self, 出来事, 始め):
+        触 = {}
+        for e in 出来事:
+            触.setdefault(e["path"], set()).update(e["種"])
+        差分 = {"追加": [], "変更": [], "削除": []}
+        途中で消えた = []
+        for 相対, 種 in sorted(触.items()):
+            p = os.path.join(self.作業場, 相対)
+            if not os.path.lexists(p):
+                (途中で消えた if "作る" in 種 else 差分["削除"]).append({"path": 相対, "行": None})
+                continue
+            if os.path.isdir(p):
+                continue
+            try:
+                st = os.lstat(p)
+                新しい = getattr(st, "st_birthtime", 0) >= 始め - 1
+            except OSError:
+                continue
+            行 = None
+            if st.st_size <= 2 * 1024 * 1024:
+                try:
+                    with open(p, "rb") as f:
+                        行 = sum(1 for l in f if l.strip())
+                except OSError:
+                    pass
+            差分["追加" if 新しい else "変更"].append({"path": 相対, "行": 行})
+        return 差分, 途中で消えた
+
+    @staticmethod
+    def _印(差分):
+        仕掛け = [x["path"] for k in ("追加", "変更") for x in 差分[k]
+                if "/.git/hooks/" in "/" + x["path"] or "/node_modules/.bin/" in "/" + x["path"]]
+        if 差分["削除"]:
+            return "赤", ["消した: " + "・".join(x["path"] for x in 差分["削除"][:10])]
+        if 仕掛け:
+            return "赤", ["自動で動く仕掛けを足した・変えた: " + "・".join(仕掛け[:10])]
+        if 差分["追加"] or 差分["変更"]:
+            return "緑", []
+        return "青", ["数えている場所では、何も変わっていない"]
+
+    def 一度見る(self):
+        if self.記録 is None:
+            self.記録 = self._記録を探す()
+            if self.記録 is None:
+                return
+        t = os.path.getmtime(self.記録)
+        if t == self.記録の更新:
+            return
+        self.記録の更新 = t
+        with open(self.記録, encoding="utf-8") as f:
+            msgs = json.load(f).get("messages") or []
+        if len(msgs) <= self.件数:
+            return
+        新 = msgs[self.件数:]
+        self.件数 = len(msgs)
+        文 = lambda m: m.get("content") if isinstance(m.get("content"), str) else ""
+        指示 = next((文(m) for m in 新 if m.get("role") == "user" and 文(m).strip()), "")
+        返事 = next((文(m) for m in reversed(新) if m.get("role") == "assistant" and 文(m).strip()), "")
+        見 = self.家モード.見張り
+        try:
+            見._CS.FSEventStreamFlushSync(見._st)    # 届いていない通知を流してから区切る
+        except Exception:                            # noqa: BLE001
+            pass
+        出来事, self.読んだ = 見.取り出す(self.読んだ)
+        for e in 出来事:
+            self.全部.setdefault(e["path"], set()).update(e["種"])
+        差分, 途中で消えた = self._差分(出来事, self.前の時刻)
+        拾った = 頼みから拾う(指示)
+        約 = list(dict.fromkeys(list(約束) + 拾った))
+        印, 理由 = self._印(差分)
+        self.番号 += 1
+        今 = time.time()
+        d = os.path.join(指示ごとの置き場, self.親)
+        os.makedirs(d, exist_ok=True)
+        受 = {"id": "%s-%d" % (self.親, self.番号), "親": self.親, "番号": self.番号,
+              "作業場": self.作業場, "執行": 家モード.執行, "命令": ["qwc"],
+              "指示": 指示, "AIの返事": 返事, "始めた": self.前の時刻, "終わった": 今,
+              "終わった時刻": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(今)),
+              "秒": round(今 - self.前の時刻, 1), "差分": 差分, "判定": 印, "理由": 理由,
+              "途中で作って消した": [x["path"] for x in 途中で消えた][:50],
+              "約束": 約, "拾った約束": 拾った, "照合": 約束と照らす(self.g, 差分, 約),
+              "数えていない場所": list(家の雑音),
+              "見方": "この指示の間に OS（FSEvents）が知らせてきた変更から作った。見比べはしていない。"
+                      "誰が変えたかは区別できない（AI 以外のアプリの変更も載る）"}
+        中 = os.path.join(d, ".%d.json.書きかけ" % self.番号)
+        with open(中, "w", encoding="utf-8") as f:
+            json.dump(受, f, ensure_ascii=False, indent=1)
+        os.replace(中, os.path.join(d, "%d.json" % self.番号))
+        self.前の時刻 = 今
+
+    def 全体(self):
+        try:
+            出来事, self.読んだ = self.家モード.見張り.取り出す(self.読んだ)
+            for e in 出来事:
+                self.全部.setdefault(e["path"], set()).update(e["種"])
+        except Exception:                            # noqa: BLE001
+            pass
+        差分, _ = self._差分([{"path": p, "種": list(k)} for p, k in self.全部.items()], self.始め)
+        印, _ = self._印(差分)
+        return {"差分": 差分, "判定": 印, "数": sum(len(v) for v in 差分.values())}
+
+
+def 受領証を見せる(r):
+    印 = {"緑": "●", "青": "○", "赤": "✗", "中断": "✗", "拒否": "✗", "失敗": "✗"}.get(r["判定"], "?")
+    print()
+    print("── 受領証 %s %s（%s 秒・証明は %s 秒前）" %
+          (印, r["判定"], r["秒"],
+           r.get("証明の古さ") if r.get("証明の古さ") is not None else "取った"))
+    for c in r["差分"]["変更"][:20]:
+        print("   変更 %s（%d行 → %d行）" % (c["path"], c["前"], c["後"]))
+    for a in r["差分"]["追加"][:20]:
+        print("   追加 %s（%d行）" % (a["path"], a["行"]))
+    for x in r["差分"]["削除"][:20]:
+        print("   削除 %s（%d行）" % (x["path"], x["行"]))
+    for y in (r.get("理由") or [])[:5]:
+        print("   ・%s" % y)
+    if 約束:
+        import guardrun as g
+        照 = 約束と照らす(g, r.get("差分") or {})
+        if 照["結果"] == "不一致":
+            print("   ✗ 約束違反: %s" % " / ".join(照["食い違い"]))
+        else:
+            print("   ○ 変えない約束（%s）は守られた" % "・".join(約束))
+    if r["壁に当たった"]:
+        print("   壁 %s" % r["壁に当たった"])
+    print("   %s" % r.get("受領証"))
+    # **終了コードは qwc 自身のものを返す。**
+    # ここを受領証の判定に置き換えたら、qwc を呼んでいる見張り
+    # （qwc-guard）が「qwc が壊れた」と誤診した（2026-09-14 に踏んだ）。
+    # 差し替えた道具が、呼ぶ側の約束を勝手に変えてはいけない。
+    # ただし**qwc が成功したのに受領証が赤いときだけ**は別で、
+    # 黙って 0 を返すと「壁が止めたのに成功に見える」ことになる。
+    子 = r.get("終了コード")
+    if 子 not in (0, None):
+        return 子 if 0 < 子 < 256 else 1
+    return 0 if r["判定"] in ("緑", "青") else 3
+
+
+def 囲いなしで走る(g, 引数):
+    """壁を張らずに、受領証だけ残す。**PC 全体を触れるが、受領証が見るのはこのフォルダの中だけ。**
+
+    執行は guardrun の 素通し（囲っていない）。受領証の「執行」にそう残るので、壁の中の受領証と
+    取り違えない。AI と同じ利用者で動くので、**受領証は AI から守られていない。**
+    上限は日常の作業に合わせて広げる（壁の中の 2MB・CPU 20分・増加 100MB では
+    ダウンロードやビルドが止まる）。証明は取る（10分は使い回す）——本人決定。"""
+    作業場 = os.getcwd()
+    if "--作業場" in 引数:
+        i = 引数.index("--作業場")
+        作業場 = 引数[i + 1]
+        引数 = 引数[:i] + 引数[i + 2:]
+    実 = os.path.realpath(作業場)
+    家 = os.path.realpath(os.path.expanduser("~"))
+    if 実 in ("/", "/Users", "/Users/Shared", "/private", "/System"):
+        print("ここ（%s）は広すぎて見比べられないので、受領証なしで走ります" % 実, file=sys.stderr)
+        素で走る(引数)
+    if 実 == 家:
+        # **家はレシートの置き場（~/.guardrun）を含むので、guardrun が作業場として断る**
+        # （正しい決まりなので曲げない）。家では 家モード（sandbox で置き場だけ書き込み禁止＋
+        # 変更の通知）で受領証を出す。確かめられなければ受領証なしで立ち上げ、そう言う。
+        家 = 家モード(g)
+        try:
+            通った, わけ = 家.確かめる()
+        except Exception as e:                              # noqa: BLE001
+            通った, わけ = False, "%s: %s" % (type(e).__name__, e)
+        if not 通った:
+            print("ホームの受領証を出せません（%s）。受領証なしで立ち上げます" % わけ, file=sys.stderr)
+            素で走る(引数)
+        print("ホーム（PC 全体を触れる・受領証の置き場だけ OS が守る・変更は OS の通知で数える）",
+              file=sys.stderr)
+        return 家.走る(引数)
+    print("囲いなし（PC 全体を触れる・受領証が見るのはこのフォルダの中だけ）", file=sys.stderr)
+    node = shutil.which("node") or "/opt/homebrew/bin/node"
+    時間 = 8 * 3600
+    見張り = 指示ごとの見張り(g, 作業場).始める()
+    try:
+        r = g.run([node, 本体] + 引数, 作業場,
+                  期待=({"変えない": 約束} if 約束 else None), 宣言者="qwc（--変えない・頼みの文から拾った約束）" if 約束 else None,
+                  enforcer=g.素通し(), require=g.嘘と沈黙だけ, prove=True,
+                  wall_sec=時間, cpu_sec=時間,
+                  max_file_bytes=8 * 1024 ** 3, max_add_bytes=50 * 1024 ** 3, max_add_files=200_000,
+                  対話=True)
+    finally:
+        見張り.終える()
+    return 受領証を見せる(r)
+
+
 def main():
+    global 約束
     引数 = sys.argv[1:]
-    if "--壁なし" in 引数 or os.environ.get("GUARDRUN_OFF") == "1":
-        素で走る([a for a in 引数 if a != "--壁なし"])
     if "--受領証" in 引数:
         return 受領証を並べる()
+    if "--変えない" in 引数:
+        i = 引数.index("--変えない")
+        約束 = [x.strip() for x in (引数[i + 1] if i + 1 < len(引数) else "").split(",") if x.strip()]
+        引数 = 引数[:i] + 引数[i + 2:]
+    # 一言の頼み（-p）は走らせる前に文が決まっているので、ここで拾って正式な受領証の約束にも入れる
+    for 旗 in ("-p", "--prompt"):
+        if 旗 in 引数 and 引数.index(旗) + 1 < len(引数):
+            拾った = 頼みから拾う(引数[引数.index(旗) + 1])
+            if 拾った:
+                print("頼みの文から拾った約束: %s は変えない" % "・".join(拾った), file=sys.stderr)
+                約束 = list(dict.fromkeys(約束 + 拾った))
+    # **既定は壁なし（PC 全体を触れる）。壁は `--壁` で名指ししたときだけ。**（2026-10-05・本人決定）
+    # 9/14 に既定を壁にしたが、壁の中では家の他の場所を触れず、本人の日常の用途
+    # （PC 全体の操作）に合わなかった。壁なしでは --yolo を付けないので、qwc 自身の確認は出る。
+    # **壁なしでも受領証は残す**（同日・本人決定）。guardrun の 素通し（囲っていない）で走らせ、
+    # 証明は「確かめる」側（嘘と沈黙だけ）。`--壁なし` と明示したときだけ、guardrun も通さない。
+    壁 = "--壁" in 引数 or os.environ.get("QWC_WALL") == "1"
+    if "--壁なし" in 引数 or os.environ.get("GUARDRUN_OFF") == "1":
+        素で走る([a for a in 引数 if a not in ("--壁なし", "--壁")])
+    引数 = [a for a in 引数 if a != "--壁"]
     if 引数 and 引数[0] in ("-h", "--help", "--version", "-v"):
         # 使い方や版の表示に壁は要らない（30秒の証明を待たせない）
         素で走る(引数)
@@ -134,14 +701,27 @@ def main():
     try:
         import guardrun as g
     except Exception as e:
-        print("guardrun が読めないので、壁なしで走ります: %s" % e, file=sys.stderr)
+        print("guardrun が読めないので、受領証なしで走ります: %s" % e, file=sys.stderr)
         素で走る(引数)
+    if not 壁:
+        return 囲いなしで走る(g, 引数)
 
     作業場 = os.getcwd()
-    if "--作業場" in 引数:
+    指定あり = "--作業場" in 引数
+    if 指定あり:
         i = 引数.index("--作業場")
         作業場 = 引数[i + 1]
         引数 = 引数[:i] + 引数[i + 2:]
+    # **家で `qwc` とだけ打ったら、専用の作業場へ移って壁の中で立ち上げる。**（2026-10-05・本人決定）
+    # 家を作業場にはできない（下の「危ない」）が、断るだけだと打ち慣れた `qwc` が
+    # 立ち上がらなくなり、結局 --壁なし が日常になる。壁を残したまま立ち上がる側に倒す。
+    # わざわざ --作業場 で家を名指しした場合は、今までどおり断る。
+    家 = os.path.realpath(os.path.expanduser("~"))
+    if not 指定あり and os.path.realpath(作業場) == 家:
+        作業場 = os.path.join(家, "qwc作業場")
+        os.makedirs(作業場, exist_ok=True)
+        print("ホームは作業場にできないので ~/qwc作業場 で立ち上げます"
+              "（ほかのフォルダで使うなら、そこに移ってから qwc --壁）", file=sys.stderr)
     # **家そのものや、その上を作業場にしない。**
     # 作業場は「書いてよい場所」なので、ここが家だと契約が
     # 「家じゅうに書いてよい」になる——壁を立てながら自分で開ける形。
@@ -193,9 +773,19 @@ def main():
     # Tavily の鍵（~/.qwythos-code/.env）も秘密として塞いである。
     # つまり web_search / web_fetch は**必ず失敗する**。
     # 途中で失敗させて理由を探させるより、先に一行で言うほうが安い。
-    print("壁の中（出られるのは ollama だけ・調べものは --壁なし で）",
+    print("壁の中（出られるのは ollama だけ・調べものは --壁 を付けずに）",
           file=sys.stderr)
-    r = g.run([node, 本体] + 引数 + 足す, 作業場,
+    見張り = 指示ごとの見張り(g, 作業場).始める()
+    try:
+        r = 壁の中で走る(g, node, 引数 + 足す, 作業場)
+    finally:
+        見張り.終える()
+    return 受領証を見せる(r)
+
+
+def 壁の中で走る(g, node, 引数, 作業場):
+    return g.run([node, 本体] + 引数, 作業場,
+              期待=({"変えない": 約束} if 約束 else None), 宣言者="qwc（--変えない・頼みの文から拾った約束）" if 約束 else None,
               net_allow=["localhost:11434"],
               # qwc 自身の作業記録だけは家の中に置かせる（--resume が要る）。
               # **鍵のある ~/.qwythos-code/.env は含めない。**
@@ -203,33 +793,6 @@ def main():
               extra_reads=[os.path.join(記録の場所, "config.json"),
                            os.path.dirname(本体), os.path.dirname(os.path.dirname(本体))],
               wall_sec=3600, 対話=True)
-
-    印 = {"緑": "●", "青": "○", "赤": "✗", "中断": "✗", "拒否": "✗", "失敗": "✗"}.get(r["判定"], "?")
-    print()
-    print("── 受領証 %s %s（%s 秒・証明は %s 秒前）" %
-          (印, r["判定"], r["秒"],
-           r.get("証明の古さ") if r.get("証明の古さ") is not None else "取った"))
-    for c in r["差分"]["変更"][:20]:
-        print("   変更 %s（%d行 → %d行）" % (c["path"], c["前"], c["後"]))
-    for a in r["差分"]["追加"][:20]:
-        print("   追加 %s（%d行）" % (a["path"], a["行"]))
-    for x in r["差分"]["削除"][:20]:
-        print("   削除 %s（%d行）" % (x["path"], x["行"]))
-    for y in (r.get("理由") or [])[:5]:
-        print("   ・%s" % y)
-    if r["壁に当たった"]:
-        print("   壁 %s" % r["壁に当たった"])
-    print("   %s" % r.get("受領証"))
-    # **終了コードは qwc 自身のものを返す。**
-    # ここを受領証の判定に置き換えたら、qwc を呼んでいる見張り
-    # （qwc-guard）が「qwc が壊れた」と誤診した（2026-09-14 に踏んだ）。
-    # 差し替えた道具が、呼ぶ側の約束を勝手に変えてはいけない。
-    # ただし**qwc が成功したのに受領証が赤いときだけ**は別で、
-    # 黙って 0 を返すと「壁が止めたのに成功に見える」ことになる。
-    子 = r.get("終了コード")
-    if 子 not in (0, None):
-        return 子 if 0 < 子 < 256 else 1
-    return 0 if r["判定"] in ("緑", "青") else 3
 
 
 if __name__ == "__main__":
